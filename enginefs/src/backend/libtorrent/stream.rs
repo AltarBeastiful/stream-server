@@ -99,12 +99,13 @@ impl LibtorrentFileStream {
                 // Don't clear deadlines - this is the key fix for container metadata!
             }
             SeekType::UserScrub => {
-                // User scrub - full reset for new playback position
+                // User scrub - add new deadlines for the new position but do NOT clear
+                // existing ones. Other streams may be waiting for earlier pieces; clearing
+                // their deadlines would stall those pieces indefinitely.
                 tracing::debug!(
-                    "set_priorities: UserScrub to piece {} - resetting all priorities",
+                    "set_priorities: UserScrub to piece {} - preserving existing deadlines",
                     current_piece
                 );
-                self.handle.clear_piece_deadlines();
             }
         }
 
@@ -320,6 +321,11 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             self.piece_waiter
                 .register(&self.info_hash, piece, cx.waker().clone());
 
+            // Re-assert urgency every wakeup: set priority 7 + deadline 0ms so libtorrent
+            // never deprioritizes this piece after its original deadline expires.
+            self.handle.set_piece_priority(piece, 7);
+            self.handle.set_piece_deadline(piece, 0);
+
             let waker = cx.waker().clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -355,23 +361,52 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
         }
 
         // Piece is downloaded but not in cache — read directly from memory storage
+        // FAST PATH: serve immediately without any async round-trip
         if piece >= 0 && !self.requested_piece_via_api.contains_key(&piece) {
             let piece_data = libtorrent_sys::memory_read_piece_for_hash(&self.info_hash, piece);
             if !piece_data.is_empty() {
-                // Got data directly! Cache it and serve immediately on next poll.
-                let info_hash = self.info_hash.clone();
-                let cache = self.piece_cache.clone();
-                let waiter = self.piece_waiter.clone();
-                self.requested_piece_via_api.insert(piece, Instant::now());
                 tracing::info!(
                     "poll_read: Direct read piece {} from memory storage ({} bytes)",
                     piece,
                     piece_data.len()
                 );
+
+                // Serve bytes immediately — no async round-trip needed for completed pieces
+                let offset_in_cached =
+                    ((self.file_offset + pos) % self.piece_length) as usize;
+                let available = piece_data.len().saturating_sub(offset_in_cached);
+                let to_read = buf.remaining().min(available);
+                if to_read > 0 {
+                    buf.put_slice(
+                        &piece_data[offset_in_cached..offset_in_cached + to_read],
+                    );
+                    self.current_pos += to_read as u64;
+                    if !self.first_read_logged {
+                        self.first_read_logged = true;
+                        tracing::info!(
+                            "startup: first direct-stream bytes ready after {:?} (piece={}, source=memory-storage)",
+                            self.created_at.elapsed(),
+                            piece
+                        );
+                    }
+                }
+
+                // Store in local cache for subsequent reads of this piece
+                let piece_arc = std::sync::Arc::new(piece_data);
+                self.cached_piece_data = Some((piece, piece_arc.clone(), 0));
+                self.requested_piece_via_api.remove(&piece);
+
+                // Background: persist into moka cache for future prefetch lookups
+                let info_hash = self.info_hash.clone();
+                let cache = self.piece_cache.clone();
+                let waiter = self.piece_waiter.clone();
+                let piece_data_clone = (*piece_arc).clone();
                 tokio::spawn(async move {
-                    cache.put_piece(&info_hash, piece, piece_data).await;
+                    cache.put_piece(&info_hash, piece, piece_data_clone).await;
                     waiter.notify_piece_finished(&info_hash, piece);
                 });
+
+                return std::task::Poll::Ready(Ok(()));
             } else {
                 tracing::debug!(
                     "poll_read: piece {} downloaded but not yet in memory storage",
@@ -379,53 +414,14 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 );
                 self.piece_waiter
                     .register(&self.info_hash, piece, cx.waker().clone());
-            }
 
-            let waker = cx.waker().clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                waker.wake();
-            });
-            return std::task::Poll::Pending;
-        }
-
-        // Piece was requested, waiting for cache to be populated
-        if piece >= 0 && self.requested_piece_via_api.contains_key(&piece) {
-            let should_rerequest = self
-                .requested_piece_via_api
-                .get(&piece)
-                .map(|requested_at| requested_at.elapsed() > std::time::Duration::from_millis(250))
-                .unwrap_or(false);
-            if should_rerequest {
-                tracing::warn!(
-                    "poll_read: piece {} still missing from cache after 250ms, re-reading from memory",
-                    piece
-                );
-                let piece_data = libtorrent_sys::memory_read_piece_for_hash(&self.info_hash, piece);
-                if !piece_data.is_empty() {
-                    let info_hash = self.info_hash.clone();
-                    let cache = self.piece_cache.clone();
-                    let waiter = self.piece_waiter.clone();
-                    tokio::spawn(async move {
-                        cache.put_piece(&info_hash, piece, piece_data).await;
-                        waiter.notify_piece_finished(&info_hash, piece);
-                    });
-                }
-                self.requested_piece_via_api.insert(piece, Instant::now());
+                let waker = cx.waker().clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    waker.wake();
+                });
+                return std::task::Poll::Pending;
             }
-            self.piece_waiter
-                .register(&self.info_hash, piece, cx.waker().clone());
-            tracing::trace!(
-                "poll_read: MEMORY-ONLY waiting for piece {} in cache (have_piece={})",
-                piece,
-                self.handle.have_piece(piece)
-            );
-            let waker = cx.waker().clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-                waker.wake();
-            });
-            return std::task::Poll::Pending;
         }
 
         // Should not reach here

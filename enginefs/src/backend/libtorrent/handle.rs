@@ -156,15 +156,19 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             is_complete
         );
 
-        // CRITICAL: Resume torrent if paused!
-        // Torrent may have been paused after being marked "finished" when all files had priority 0
+        // Resume torrent if paused, but ONLY when the file is not yet complete.
+        // For a 100% complete file, all pieces are already in memory storage and
+        // can be read directly without libtorrent being in an active state.
+        // Resuming a completed torrent just to immediately re-pause it wastes 25-40ms per seek.
         let status = handle.status();
-        if status.is_paused {
+        if status.is_paused && !is_complete {
             tracing::info!("get_file_reader: Resuming paused torrent for streaming");
             handle.resume();
             // Force reannounce to quickly re-acquire peers after pause
             handle.force_reannounce();
             handle.force_dht_announce();
+        } else if status.is_paused && is_complete {
+            tracing::debug!("get_file_reader: Torrent paused but file is complete — skipping resume");
         }
 
         // Set file priorities: Requested file = 4, Others = 0 (Skip)
@@ -233,11 +237,13 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             // Calculate actual start piece
             actual_start_piece = ((global_file_offset + start_offset) / piece_length) as i32;
 
-            // CRITICAL FIX: Only clear deadlines for non-container-metadata requests
-            // Container metadata requests should ADD priorities, not replace them
-            // This prevents wiping out head piece priorities (piece 0-7) which are
-            // essential for playback to start
-            if !matches!(seek_type, SeekType::ContainerMetadata) {
+            // Only clear all piece deadlines for a fresh InitialPlayback.
+            // - ContainerMetadata seeks ADD priorities on top of existing ones (don't wipe head pieces).
+            // - UserScrub seeks also must NOT clear, because other active streams may be waiting for
+            //   earlier pieces (e.g. piece 8). Clearing their deadlines causes those pieces to lose
+            //   urgency and stall for a very long time. The new CRITICAL deadlines for the seek
+            //   position are simply added on top; they win via tighter deadlines.
+            if matches!(seek_type, SeekType::InitialPlayback) {
                 handle.clear_piece_deadlines();
             }
 
