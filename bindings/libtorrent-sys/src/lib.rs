@@ -49,6 +49,10 @@ mod ffi {
         announce_to_all_trackers: bool,
         /// Announce to all tiers
         announce_to_all_tiers: bool,
+        /// Block request timeout in seconds before retrying from another peer (0 = use hardcoded default of 10s)
+        request_timeout: i32,
+        /// Piece reassignment timeout in seconds (0 = use hardcoded default of 5s)
+        piece_timeout: i32,
     }
 
     /// Torrent addition parameters

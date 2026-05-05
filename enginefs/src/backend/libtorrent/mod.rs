@@ -61,6 +61,9 @@ impl LibtorrentBackend {
             proxy_type: 0,
             announce_to_all_trackers: true,
             announce_to_all_tiers: true,
+            // bt_request_timeout is in ms; libtorrent expects seconds
+            request_timeout: (config.speed_profile.bt_request_timeout / 1000) as i32,
+            piece_timeout: 0, // use C++ hardcoded default (5s)
         };
 
         tracing::info!(
@@ -179,6 +182,8 @@ impl LibtorrentBackend {
             proxy_type: 0,
             announce_to_all_trackers: true,
             announce_to_all_tiers: true,
+            request_timeout: (profile.bt_request_timeout / 1000) as i32,
+            piece_timeout: 0, // use C++ hardcoded default (5s)
         };
 
         if let Err(e) = session.apply_settings(&new_settings) {

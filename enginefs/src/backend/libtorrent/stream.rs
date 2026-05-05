@@ -59,6 +59,9 @@ pub(crate) struct LibtorrentFileStream {
     /// Last time we emitted a periodic "still waiting for piece" log line.
     /// Allows time-based throttling regardless of position alignment.
     pub(crate) last_wait_log: Option<Instant>,
+    /// Last time we called reset_piece_deadline + set_piece_deadline to nudge
+    /// libtorrent into re-evaluating the peer for a stuck piece.
+    pub(crate) last_deadline_reset_at: Option<Instant>,
     /// Deadline (ms in the future) used by the wait loop in `poll_read` when
     /// re-asserting urgency on a piece. Lower = more urgent.
     ///
@@ -363,10 +366,16 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 || self.last_wait_log.map_or(true, |t| now.duration_since(t).as_secs() >= 2);
             if should_log {
                 let status = self.handle.status();
+                // Check neighbors for hole detection: have pieces N+1..N+3 been
+                // downloaded while N itself is missing?  That's a piece hole.
+                let next_have: Vec<bool> = (1..=3)
+                    .map(|d| self.handle.have_piece(piece + d))
+                    .collect();
+                let is_hole = next_have.iter().any(|&h| h);
                 if !self.first_wait_logged {
                     self.first_wait_logged = true;
                     tracing::info!(
-                        "poll_read: FIRST WAIT for piece {} ({:?}, pos={}, peers={}, speed={:.1}MB/s, paused={}, wait_deadline={}ms)",
+                        "poll_read: FIRST WAIT for piece {} ({:?}, pos={}, peers={}, speed={:.1}MB/s, paused={}, wait_deadline={}ms, next_have={:?})",
                         piece,
                         self.seek_type,
                         pos,
@@ -374,10 +383,11 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                         status.download_rate as f64 / 1_000_000.0,
                         status.is_paused,
                         self.wait_deadline_ms,
+                        next_have,
                     );
                 } else {
                     tracing::info!(
-                        "poll_read: STILL WAITING for piece {} ({:?}, elapsed={:.1}s, pos={}, peers={}, speed={:.1}MB/s, paused={})",
+                        "poll_read: STILL WAITING for piece {} ({:?}, elapsed={:.1}s, pos={}, peers={}, speed={:.1}MB/s, paused={}, hole={}, next_have={:?})",
                         piece,
                         self.seek_type,
                         self.created_at.elapsed().as_secs_f64(),
@@ -385,9 +395,33 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                         status.num_peers,
                         status.download_rate as f64 / 1_000_000.0,
                         status.is_paused,
+                        is_hole,
+                        next_have,
                     );
                 }
                 self.last_wait_log = Some(now);
+            }
+
+            // STUCK-PIECE NUDGE: after 10s on same piece, re-assert priority/deadline.
+            // NOTE: We intentionally do NOT call reset_piece_deadline here — that
+            // temporarily removes the piece from libtorrent's deadline queue and was
+            // measured to drop download speed from 8 MB/s to 0.2 MB/s.  libtorrent
+            // already handles slow-peer re-requests via request_timeout (configured
+            // at session creation), so the only safe nudge is to keep asserting the
+            // highest priority so the piece never drifts to a lower urgency bucket.
+            let elapsed_secs = self.created_at.elapsed().as_secs();
+            let needs_nudge = elapsed_secs >= 10
+                && self.last_deadline_reset_at
+                    .map_or(true, |t| now.duration_since(t).as_secs() >= 10);
+            if needs_nudge {
+                self.handle.set_piece_priority(piece, 7);
+                self.handle.set_piece_deadline(piece, 0);
+                self.last_deadline_reset_at = Some(now);
+                tracing::info!(
+                    "poll_read: NUDGE re-asserted priority/deadline for stuck piece {} (elapsed={:.1}s)",
+                    piece,
+                    elapsed_secs as f64,
+                );
             }
 
             return std::task::Poll::Pending;

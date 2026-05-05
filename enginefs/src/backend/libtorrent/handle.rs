@@ -299,8 +299,10 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                     (0, pieces_needed, "URGENT")
                 }
                 SeekType::UserScrub => {
-                    // CRITICAL: 300ms for user seeks, small window
-                    (300, 4, "CRITICAL")
+                    // CRITICAL: 300ms for user seeks. Window=8 so pieces ahead are
+                    // already in flight when the target arrives — avoids sequential
+                    // holes where one slow peer blocks piece N while N+1..N+7 download.
+                    (300, 8, "CRITICAL")
                 }
                 SeekType::ContainerMetadata => {
                     // Container metadata - high priority, small window
@@ -457,6 +459,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             first_read_logged: false,
             first_wait_logged: false,
             last_wait_log: None,
+            last_deadline_reset_at: None,
         }))
     }
 

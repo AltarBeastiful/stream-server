@@ -168,7 +168,6 @@ std::unique_ptr<Session> create_session(SessionSettings const &settings) {
   pack.set_int(lt::settings_pack::seed_choking_algorithm, 2);
 
   // Connection tuning
-  pack.set_int(lt::settings_pack::request_timeout, 10);
   pack.set_int(lt::settings_pack::peer_timeout, 60);
   pack.set_int(lt::settings_pack::min_reconnect_time, 1);
   pack.set_int(lt::settings_pack::max_failcount, 3);
@@ -193,12 +192,14 @@ std::unique_ptr<Session> create_session(SessionSettings const &settings) {
   // Faster connections for streaming
   pack.set_bool(lt::settings_pack::smooth_connects,
                 false); // Don't spread out connection attempts
+  // piece_timeout: seconds before a piece is considered stalled and re-requested from another peer
   pack.set_int(lt::settings_pack::piece_timeout,
-               5); // Time before considering piece stalled (was 20)
+               settings.piece_timeout > 0 ? settings.piece_timeout : 5);
   pack.set_int(lt::settings_pack::peer_connect_timeout,
                3); // Faster peer connection timeout (was 15)
+  // request_timeout: seconds before a block request is retried from another peer
   pack.set_int(lt::settings_pack::request_timeout,
-               10); // Faster request timeout (was 60)
+               settings.request_timeout > 0 ? settings.request_timeout : 10);
 
   // Increase request queue depth for more aggressive downloading
   pack.set_int(lt::settings_pack::max_out_request_queue, 500); // Default 200
@@ -277,7 +278,6 @@ create_session_memory_only(SessionSettings const &settings) {
   pack.set_int(lt::settings_pack::send_buffer_low_watermark, 10 * 1024);
   pack.set_int(lt::settings_pack::choking_algorithm, 0);
   pack.set_int(lt::settings_pack::seed_choking_algorithm, 2);
-  pack.set_int(lt::settings_pack::request_timeout, 10);
   pack.set_int(lt::settings_pack::peer_timeout, 60);
   pack.set_int(lt::settings_pack::min_reconnect_time, 1);
   pack.set_int(lt::settings_pack::max_failcount, 3);
@@ -293,8 +293,11 @@ create_session_memory_only(SessionSettings const &settings) {
   pack.set_bool(lt::settings_pack::strict_end_game_mode, true);
   pack.set_bool(lt::settings_pack::prioritize_partial_pieces, true);
   pack.set_bool(lt::settings_pack::smooth_connects, false);
-  pack.set_int(lt::settings_pack::piece_timeout, 5);
+  pack.set_int(lt::settings_pack::piece_timeout,
+               settings.piece_timeout > 0 ? settings.piece_timeout : 5);
   pack.set_int(lt::settings_pack::peer_connect_timeout, 3);
+  pack.set_int(lt::settings_pack::request_timeout,
+               settings.request_timeout > 0 ? settings.request_timeout : 10);
   pack.set_int(lt::settings_pack::max_out_request_queue, 500);
   pack.set_int(lt::settings_pack::max_allowed_in_request_queue, 250);
   pack.set_int(lt::settings_pack::request_queue_time, 3);
@@ -352,6 +355,10 @@ void session_apply_settings(Session &session, SessionSettings const &settings) {
   if (settings.upload_rate_limit >= 0)
     pack.set_int(lt::settings_pack::upload_rate_limit,
                  settings.upload_rate_limit);
+  if (settings.request_timeout > 0)
+    pack.set_int(lt::settings_pack::request_timeout, settings.request_timeout);
+  if (settings.piece_timeout > 0)
+    pack.set_int(lt::settings_pack::piece_timeout, settings.piece_timeout);
   session.session.apply_settings(pack);
 }
 
