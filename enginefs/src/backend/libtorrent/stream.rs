@@ -40,8 +40,8 @@ pub(crate) struct LibtorrentFileStream {
     pub(crate) info_hash: String,
     /// Currently cached piece data for fast serving (L0 per-stream cache).
     /// Avoids even a hot-tier lookup for sequential reads within the same piece.
-    /// Tuple: (piece_idx, data, file_relative_start)
-    pub(crate) cached_piece_data: Option<(i32, Bytes, u64)>,
+    /// Tuple: (piece_idx, data)
+    pub(crate) cached_piece_data: Option<(i32, Bytes)>,
     /// Last piece we triggered prefetch for (to avoid repeated requests)
     pub(crate) last_prefetch_piece: i32,
     /// Track pieces we've requested via read_piece() API to avoid duplicate requests
@@ -218,13 +218,13 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
         if piece >= 0 {
             // Check if we already have the right piece cached locally
             let have_cached = match &self.cached_piece_data {
-                Some((cached_piece, _, _)) => *cached_piece == piece,
+                Some((cached_piece, _)) => *cached_piece == piece,
                 None => false,
             };
 
             if have_cached {
                 // Serve from local cache - FASTEST PATH
-                if let Some((_, data, _)) = &self.cached_piece_data {
+                if let Some((_, data)) = &self.cached_piece_data {
                     let offset_in_cached = ((self.file_offset + pos) % self.piece_length) as usize;
                     let available = data.len().saturating_sub(offset_in_cached);
                     let to_read = buf.remaining().min(available);
@@ -287,7 +287,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 }
 
                 // Store in L0 cache for sequential reads within the same piece.
-                self.cached_piece_data = Some((piece, piece_data, 0));
+                self.cached_piece_data = Some((piece, piece_data));
 
                 // === READ-AHEAD PREFETCH ===
                 if piece != self.last_prefetch_piece {
@@ -308,10 +308,11 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                         2
                     };
 
-                    // Spawn background prefetch task: reads pieces from C++ memory storage
-                    // and inserts them into the hot tier so they're ready before poll_read
-                    // needs them.
-                    tokio::spawn(async move {
+                    // Spawn a blocking task: memory_read_piece_for_hash and have_piece
+                    // both acquire a C++ mutex (g_dio_mutex / session lock). Running them
+                    // inside tokio::spawn(async) would stall a worker thread for the
+                    // duration of the mutex acquisition under contention.
+                    tokio::task::spawn_blocking(move || {
                         for i in 1..=prefetch_count {
                             let next_piece = piece + i;
                             if next_piece > last_piece {
@@ -483,7 +484,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 // is tracked for size-based eviction to the warm disk tier.
                 self.piece_cache.put(&self.info_hash, piece, piece_bytes.clone());
                 // Store in L0 per-stream cache for the next sequential read.
-                self.cached_piece_data = Some((piece, piece_bytes, 0));
+                self.cached_piece_data = Some((piece, piece_bytes));
 
                 return std::task::Poll::Ready(Ok(()));
             } else {
@@ -512,7 +513,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                         }
                     }
                     self.requested_piece_via_api.remove(&piece);
-                    self.cached_piece_data = Some((piece, warm_data, 0));
+                    self.cached_piece_data = Some((piece, warm_data));
                     return std::task::Poll::Ready(Ok(()));
                 }
 

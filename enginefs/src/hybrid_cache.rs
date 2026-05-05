@@ -159,9 +159,10 @@ impl WarmTier {
             .or_insert(piece_length);
     }
 
-    /// Write a piece to disk. Silently skips if piece_length is unknown (not yet
-    /// registered). Called from the blocking drain task.
-    fn write_piece_sync(&self, info_hash: &str, piece_idx: i32, data: &Bytes) {
+    /// Write a piece to disk. Returns `true` if the piece was successfully persisted,
+    /// `false` if skipped or an error occurred. The caller must NOT free C++ RAM when
+    /// this returns `false`. Called from the blocking drain task.
+    fn write_piece_sync(&self, info_hash: &str, piece_idx: i32, data: &Bytes) -> bool {
         let ih = info_hash.to_lowercase();
         let piece_length = {
             let pl = self.piece_lengths.read();
@@ -172,46 +173,45 @@ impl WarmTier {
                         "WarmTier: piece_length unknown for {} — skipping disk write of piece {}",
                         ih, piece_idx
                     );
-                    return;
+                    return false;
                 }
             }
         };
 
         let mut files = self.files.write();
-        let wf = files.entry(ih.clone()).or_insert_with(|| {
+        if !files.contains_key(&ih) {
             let path = self.dir.join(&ih).join("pieces.flat");
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            WarmFile::new(&path, piece_length).unwrap_or_else(|e| {
-                warn!("WarmTier: cannot create flat file for {}: {}", ih, e);
-                // Fallback: /dev/null — writes silently succeed but data is lost.
-                // This is better than panicking; the piece will stay in C++ RAM.
-                WarmFile {
-                    file: std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open("/dev/null")
-                        .unwrap(),
-                    piece_length_padded: (piece_length + 4095) & !4095,
-                    present: HashMap::new(),
-                    allocated_len: 0,
+            match WarmFile::new(&path, piece_length) {
+                Ok(wf) => { files.insert(ih.clone(), wf); }
+                Err(e) => {
+                    warn!(
+                        "WarmTier: cannot create flat file for {} — piece {} stays in C++ RAM: {}",
+                        ih, piece_idx, e
+                    );
+                    return false;
                 }
-            })
-        });
+            }
+        }
+        let wf = files.get_mut(&ih).expect("just inserted");
 
-        if let Err(e) = wf.write_piece(piece_idx, data) {
-            warn!(
-                "WarmTier: write_piece failed for {}:{}: {}",
-                ih, piece_idx, e
-            );
-        } else {
-            debug!(
-                "WarmTier: piece {} for {} persisted ({} bytes)",
-                piece_idx,
-                ih,
-                data.len()
-            );
+        match wf.write_piece(piece_idx, data) {
+            Ok(()) => {
+                debug!(
+                    "WarmTier: piece {} for {} persisted ({} bytes)",
+                    piece_idx, ih, data.len()
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    "WarmTier: write_piece failed for {}:{}: {}",
+                    ih, piece_idx, e
+                );
+                false
+            }
         }
     }
 
@@ -313,6 +313,8 @@ impl HybridPieceCache {
                     v.len().min(u32::MAX as usize) as u32
                 })
                 .max_capacity(config.max_hot_bytes)
+                // Required for invalidate_entries_if() used in remove_torrent().
+                .support_invalidation_closures()
                 .eviction_listener(
                     move |key: std::sync::Arc<PieceKey>, value: Bytes, _cause| {
                         // Called from moka's maintenance thread. Must not block.
@@ -326,31 +328,37 @@ impl HybridPieceCache {
                 .build()
         };
 
-        // Drain task: sequentially writes evicted pieces to disk and frees C++ RAM.
+        // Drain task: sequentially writes evicted pieces to disk, then frees C++ RAM.
         // Uses spawn_blocking because pwrite is synchronous OS I/O.
+        // Sequential by design: only one piece is processed at a time, so C++ RAM is
+        // freed only AFTER the warm-tier write is confirmed durable (within the session).
         tokio::task::spawn_blocking(move || {
             loop {
                 match evict_rx.recv() {
                     Ok(evicted) => {
-                        // 1. Persist to warm tier. Must complete before freeing C++.
-                        warm_clone.write_piece_sync(
+                        // 1. Persist to warm tier. Returns true only if the write
+                        //    completed successfully. On failure the piece is NOT freed
+                        //    from C++ — it stays available at the cost of C++ RAM.
+                        let persisted = warm_clone.write_piece_sync(
                             &evicted.info_hash,
                             evicted.piece_idx,
                             &evicted.data,
                         );
 
-                        // 2. Free C++ in-memory bytes for this piece.
-                        //    libtorrent's bitfield is unaffected — have_piece() stays true.
-                        #[cfg(feature = "libtorrent")]
-                        {
-                            libtorrent_sys::memory_evict_piece_for_hash(
-                                &evicted.info_hash,
-                                evicted.piece_idx,
-                            );
+                        // 2. Free C++ in-memory bytes — only when durably written.
+                        //    libtorrent's bitfield is unaffected; have_piece() stays true.
+                        if persisted {
+                            #[cfg(feature = "libtorrent")]
+                            {
+                                libtorrent_sys::memory_evict_piece_for_hash(
+                                    &evicted.info_hash,
+                                    evicted.piece_idx,
+                                );
+                            }
                         }
                     }
                     Err(_) => {
-                        // Channel closed (cache dropped) — shut down.
+                        // Channel closed (HybridPieceCache dropped) — shut down.
                         debug!("HybridPieceCache: eviction drain task exiting");
                         break;
                     }
@@ -418,13 +426,17 @@ impl HybridPieceCache {
 
     /// Remove all cached data for a torrent (hot tier entries + warm tier flat file).
     ///
-    /// Hot tier uses `invalidate_all` (moka limitation: no prefix removal).
-    /// This is acceptable because `remove_torrent` is a rare, slow-path operation.
+    /// Uses `invalidate_entries_if` to evict only this torrent's pieces from the hot
+    /// tier. This requires `.support_invalidation_closures()` on the moka builder.
+    ///
+    /// Note: `invalidate_entries_if` is asynchronous — entries are invalidated on
+    /// the next moka maintenance run, not immediately. For `remove_torrent` (a
+    /// rare slow-path operation) this eventual consistency is acceptable.
     pub fn remove_torrent(&self, info_hash: &str) {
-        // moka does not expose per-prefix removal; invalidate_all evicts everything
-        // across all torrents. The eviction listener will try to write them to disk,
-        // but the subsequent warm.remove() cleans up the disk directory.
-        self.hot.invalidate_all();
+        let ih = info_hash.to_lowercase();
+        // Evict only this torrent's entries from the hot tier, leaving all other
+        // torrents' pieces intact.
+        let _ = self.hot.invalidate_entries_if(move |k: &PieceKey, _v: &Bytes| k.0 == ih);
         self.warm.remove(info_hash);
     }
 
