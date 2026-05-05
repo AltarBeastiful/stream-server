@@ -161,6 +161,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         // can be read directly without libtorrent being in an active state.
         // Resuming a completed torrent just to immediately re-pause it wastes 25-40ms per seek.
         let status = handle.status();
+        let was_just_resumed = status.is_paused && !is_complete;
         if status.is_paused && !is_complete {
             tracing::info!("get_file_reader: Resuming paused torrent for streaming");
             handle.resume();
@@ -169,27 +170,6 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             handle.force_dht_announce();
         } else if status.is_paused && is_complete {
             tracing::debug!("get_file_reader: Torrent paused but file is complete — skipping resume");
-        }
-
-        // Set file priorities: Requested file = 4, Others = 0 (Skip)
-        // This ensures all bandwidth goes to the stream
-        let all_files = handle.files();
-        for (idx, f) in all_files.iter().enumerate() {
-            if idx == file_idx {
-                tracing::debug!(
-                    "get_file_reader: Setting PRIORITY 4 (NORMAL) for file idx={} name={}",
-                    idx,
-                    f.path
-                );
-                handle.set_file_priority(idx as i32, 4);
-            } else {
-                tracing::debug!(
-                    "get_file_reader: Setting PRIORITY 0 (SKIP) for file idx={} name={}",
-                    idx,
-                    f.path
-                );
-                handle.set_file_priority(idx as i32, 0);
-            }
         }
 
         let actual_start_piece: i32;
@@ -219,47 +199,85 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             UserScrub,         // user is seeking mid-video
         }
 
-        let seek_type = {
-            if start_offset == 0 {
-                SeekType::InitialPlayback
+        // Pre-compute the start piece BEFORE classifying the seek type.
+        // PLAN-001 Bug 1: previously a `start_offset` of e.g. 5655 (still inside
+        // piece 0) was treated as `UserScrub` and its 600 ms deadline overwrote
+        // the 0 ms URGENT deadline that an initial-playback request had just
+        // installed on piece 0. Classifying by *piece* keeps both head requests
+        // sharing an URGENT deadline.
+        let prelim_start_piece = ((global_file_offset + start_offset) / piece_length) as i32;
+
+        let seek_type = if prelim_start_piece == first_piece {
+            SeekType::InitialPlayback
+        } else {
+            // Near end of file = container metadata (last 10MB or last 5%)
+            let end_threshold = container_metadata_start(file_size);
+            if start_offset >= end_threshold {
+                SeekType::ContainerMetadata
             } else {
-                // Near end of file = container metadata (last 10MB or last 5%)
-                let end_threshold = container_metadata_start(file_size);
-                if start_offset >= end_threshold {
-                    SeekType::ContainerMetadata
-                } else {
-                    SeekType::UserScrub
-                }
+                SeekType::UserScrub
             }
         };
 
         if !skip_prioritization {
             // Calculate actual start piece
-            actual_start_piece = ((global_file_offset + start_offset) / piece_length) as i32;
+            actual_start_piece = prelim_start_piece;
 
-            // Only clear all piece deadlines for a fresh InitialPlayback.
-            // - ContainerMetadata seeks ADD priorities on top of existing ones (don't wipe head pieces).
-            // - UserScrub seeks also must NOT clear, because other active streams may be waiting for
-            //   earlier pieces (e.g. piece 8). Clearing their deadlines causes those pieces to lose
-            //   urgency and stall for a very long time. The new CRITICAL deadlines for the seek
-            //   position are simply added on top; they win via tighter deadlines.
+            // Set file priorities: Requested file = 4, Others = 0 (Skip).
+            // This ensures all bandwidth goes to the stream. PLAN-001 Bug 4:
+            // skip this loop entirely for complete files / internal readers,
+            // since each FFI call costs ~1ms and adds up across many files.
+            let all_files = handle.files();
+            for (idx, f) in all_files.iter().enumerate() {
+                if idx == file_idx {
+                    tracing::debug!(
+                        "get_file_reader: Setting PRIORITY 4 (NORMAL) for file idx={} name={}",
+                        idx,
+                        f.path
+                    );
+                    handle.set_file_priority(idx as i32, 4);
+                } else {
+                    tracing::debug!(
+                        "get_file_reader: Setting PRIORITY 0 (SKIP) for file idx={} name={}",
+                        idx,
+                        f.path
+                    );
+                    handle.set_file_priority(idx as i32, 0);
+                }
+            }
+
+            // Only clear deadlines on a fresh InitialPlayback. UserScrub and
+            // ContainerMetadata add their priorities on top of existing ones
+            // because a sibling stream (e.g. the player's other connection
+            // for end-of-file metadata) may be waiting on a piece whose
+            // deadline we'd otherwise wipe. The wait loop in poll_read does
+            // refresh urgency, but only every 50ms — clearing here on every
+            // request would still create gaps where the picker can drift.
             if matches!(seek_type, SeekType::InitialPlayback) {
                 handle.clear_piece_deadlines();
             }
 
-            // Get download speed for dynamic adjustment (0 if unknown)
+            // Get download speed for dynamic adjustment (0 if unknown).
             let download_speed = handle.status().download_rate as u64; // bytes/sec
 
-            // Dynamic deadline multiplier based on download speed
-            // Faster downloads = tighter deadlines, slower = more slack
+            // Dynamic deadline multiplier based on download speed.
+            // PLAN-001 Bug 2: a download_rate of 0 used to mean "very slow ->
+            // double deadlines", but in practice it's also what we observe
+            // immediately after an auto-pause/resume (we just resumed the
+            // torrent above; peers haven't replied yet). Penalising a
+            // just-resumed torrent makes the seek wait even longer. Treat 0
+            // as "unknown -> normal" to keep deadlines tight.
             let speed_factor = if download_speed > 5_000_000 {
                 0.5 // Fast (>5MB/s): halve deadlines
             } else if download_speed > 1_000_000 {
                 1.0 // Normal (1-5MB/s): standard deadlines
             } else if download_speed > 100_000 {
                 1.5 // Slow (100KB-1MB/s): 1.5x deadlines
+            } else if download_speed > 0 {
+                1.5 // Very slow (<100KB/s): 1.5x rather than 2x
             } else {
-                2.0 // Very slow (<100KB/s): double deadlines
+                // Unknown speed (just resumed, or no peers yet) — don't penalise.
+                1.0
             };
 
             // Base deadlines and window sizes per seek type
@@ -298,29 +316,46 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             };
 
             tracing::info!(
-                "get_file_reader: {} - {} pieces from piece {} (deadlines {}ms+, speed={:.1}MB/s)",
+                "get_file_reader: {} - {} pieces from piece {} (deadlines {}ms+, speed={:.1}MB/s, just_resumed={})",
                 label,
                 window_size,
                 actual_start_piece,
                 adjusted_deadline,
-                download_speed as f64 / 1_000_000.0
+                download_speed as f64 / 1_000_000.0,
+                was_just_resumed
             );
 
-            // Set piece PRIORITY and DEADLINE with staircase pattern
-            // CRITICAL: Both are needed! Priority 7 = highest, deadline = time constraint
-            for i in 0..window_size {
-                let p = actual_start_piece + i;
-                if p <= last_piece {
-                    handle.set_piece_priority(p, 7); // Highest priority - ESSENTIAL for download
-                    let deadline = adjusted_deadline + i * 10;
-                    handle.set_piece_deadline(p, deadline);
+            // Set piece PRIORITY and DEADLINE with staircase pattern.
+            // PLAN-001 Bug 2: for UserScrub the *first* piece always gets a 0ms
+            // (ASAP) deadline — the player is blocked on this exact piece, so
+            // there's no point waiting `adjusted_deadline` ms before libtorrent
+            // even tries to fetch it. Subsequent pieces in the window keep the
+            // adjusted staircase.
+            match seek_type {
+                SeekType::UserScrub => {
+                    handle.set_piece_priority(actual_start_piece, 7);
+                    handle.set_piece_deadline(actual_start_piece, 0);
+                    for i in 1..window_size {
+                        let p = actual_start_piece + i;
+                        if p <= last_piece {
+                            handle.set_piece_priority(p, 7);
+                            handle.set_piece_deadline(p, adjusted_deadline + (i - 1) * 10);
+                        }
+                    }
+                }
+                _ => {
+                    for i in 0..window_size {
+                        let p = actual_start_piece + i;
+                        if p <= last_piece {
+                            handle.set_piece_priority(p, 7); // Highest priority
+                            let deadline = adjusted_deadline + i * 10;
+                            handle.set_piece_deadline(p, deadline);
+                        }
+                    }
                 }
             }
 
-            // PRE-REQUEST first piece via read_piece API if already downloaded
-            // If the piece is already downloaded, read_piece() will load it from 
-            // memory storage into the cache. If NOT downloaded, skip - the 
-            // piece_finished_alert handler will call read_piece() when it's ready.
+            // PRE-REQUEST first piece via read_piece API if already downloaded.
             if handle.have_piece(actual_start_piece) {
                 let _ = handle.read_piece(actual_start_piece);
             }
@@ -339,24 +374,13 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 }
             }
 
-            // HEAD PIECE PROTECTION: Only for InitialPlayback
-            // - InitialPlayback: Already prioritizes head pieces, ensures staircase order
-            // - UserScrub: Does NOT need head pieces - user is playing from a different position
-            //   The player already has container info cached from previous requests
-            if matches!(
-                seek_type,
-                SeekType::InitialPlayback
-            ) {
+            // HEAD PIECE PROTECTION: Only for InitialPlayback.
+            if matches!(seek_type, SeekType::InitialPlayback) {
                 for i in 0..MAX_STARTUP_PIECES {
                     let p = first_piece + i;
                     if p <= last_piece && !handle.have_piece(p) {
-                        handle.set_piece_priority(p, 7); // ESSENTIAL - without this pieces won't download
-                        // Use staircase: 0, 10, 20... ms to maintain order
-                        // For ContainerMetadata: always set URGENT deadlines
-                        // For InitialPlayback: only set if not already at head (avoids double-setting)
-                        if matches!(seek_type, SeekType::ContainerMetadata)
-                            || actual_start_piece != first_piece
-                        {
+                        handle.set_piece_priority(p, 7);
+                        if actual_start_piece != first_piece {
                             handle.set_piece_deadline(p, (i as i32) * 10);
                         }
                     }
@@ -364,7 +388,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             }
         } else {
             // Skip prioritization for internal readers or complete files
-            actual_start_piece = ((global_file_offset + start_offset) / piece_length) as i32;
+            actual_start_piece = prelim_start_piece;
             tracing::debug!(
                 "get_file_reader: Skipping prioritization (priority={}, is_complete={})",
                 priority,
@@ -385,6 +409,19 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             SeekType::UserScrub => super::stream::SeekType::UserScrub,
         };
 
+        // Per-stream wait-loop deadline. ContainerMetadata (Cues / moov reads
+        // near EOF) and UserScrub (a fresh seek the user is blocked on) get
+        // deadline=0 so they win libtorrent's tie-breaking against any
+        // concurrent InitialPlayback stream that's just sequentially filling
+        // its head window. The InitialPlayback stream uses a small non-zero
+        // deadline (50ms) — still well within "urgent" but enough to let the
+        // sibling streams' deadline=0 pieces sort first.
+        let wait_deadline_ms: i32 = match seek_type {
+            SeekType::InitialPlayback => 50,
+            SeekType::ContainerMetadata => 0,
+            SeekType::UserScrub => 0,
+        };
+
         Ok(Box::new(LibtorrentFileStream {
             handle: handle.clone(),
             first_piece,
@@ -393,6 +430,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             file_offset: global_file_offset,
             current_pos: 0,
             is_complete,
+            wait_deadline_ms,
             last_priorities_piece: if !is_complete { actual_start_piece } else { -1 },
             cache_config: self.config.cache.clone(),
             priority,

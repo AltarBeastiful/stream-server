@@ -3,7 +3,7 @@
 //! Downloaded pieces go to memory first for immediate streaming,
 //! with optional background writes to disk.
 
-use moka::future::Cache;
+use moka::sync::Cache;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,6 +13,9 @@ use tracing::{debug, warn};
 /// In-memory cache for downloaded pieces
 /// Key: (info_hash, piece_index)
 /// Value: Raw piece data
+///
+/// Uses `moka::sync::Cache` so reads from `poll_read` (a sync `AsyncRead` impl)
+/// don't have to spawn a futures executor and park the tokio worker thread.
 pub type PieceCache = Cache<(String, i32), Arc<Vec<u8>>>;
 
 /// Configuration for piece caching behavior
@@ -113,7 +116,7 @@ impl PieceCacheManager {
         let data_len = data.len();
         let data = Arc::new(data);
 
-        self.cache.insert(key.clone(), data.clone()).await;
+        self.cache.insert(key.clone(), data.clone());
 
         // Clear from pending requests since it's now cached
         {
@@ -168,7 +171,7 @@ impl PieceCacheManager {
         let key = (info_hash.to_lowercase(), piece_idx);
 
         // Try memory cache first (fast path)
-        if let Some(data) = self.cache.get(&key).await {
+        if let Some(data) = self.cache.get(&key) {
             return Some(data);
         }
 
@@ -182,7 +185,7 @@ impl PieceCacheManager {
                 if let Ok(data) = tokio::fs::read(&piece_path).await {
                     let data = Arc::new(data);
                     // Re-populate memory cache
-                    self.cache.insert(key, data.clone()).await;
+                    self.cache.insert(key, data.clone());
                     debug!(
                         "PieceCache: Loaded piece {} from disk for {}",
                         piece_idx, info_hash
@@ -193,6 +196,14 @@ impl PieceCacheManager {
         }
 
         None
+    }
+
+    /// Synchronous in-memory cache lookup. Used in `poll_read` (a sync AsyncRead
+    /// impl) to avoid `block_on` parking the tokio worker thread.
+    /// Skips the disk fallback entirely; cold pieces fall through to libtorrent.
+    pub fn get_piece_sync(&self, info_hash: &str, piece_idx: i32) -> Option<Arc<Vec<u8>>> {
+        let key = (info_hash.to_lowercase(), piece_idx);
+        self.cache.get(&key)
     }
 
     /// Check if piece is available (in memory or disk)
@@ -206,6 +217,12 @@ impl PieceCacheManager {
         // Check disk written set (fast check without I/O)
         let disk_written = self.disk_written.read().await;
         disk_written.contains(&key)
+    }
+
+    /// Synchronous variant of `has_piece` that only checks the in-memory cache.
+    pub fn has_piece_sync(&self, info_hash: &str, piece_idx: i32) -> bool {
+        let key = (info_hash.to_lowercase(), piece_idx);
+        self.cache.contains_key(&key)
     }
 
     /// Mark a piece as pending (returns false if already pending)
@@ -226,6 +243,11 @@ impl PieceCacheManager {
     /// Get cache statistics
     pub fn stats(&self) -> (u64, u64) {
         (self.cache.entry_count(), self.cache.weighted_size())
+    }
+
+    /// Direct access to the underlying sync cache (for advanced callers).
+    pub fn raw_cache(&self) -> &PieceCache {
+        &self.cache
     }
 
     /// Clear all cached pieces for a specific torrent

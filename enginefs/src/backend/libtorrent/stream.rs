@@ -56,6 +56,21 @@ pub(crate) struct LibtorrentFileStream {
     pub(crate) first_read_logged: bool,
     /// Whether we already logged the first startup wait
     pub(crate) first_wait_logged: bool,
+    /// Deadline (ms in the future) used by the wait loop in `poll_read` when
+    /// re-asserting urgency on a piece. Lower = more urgent.
+    ///
+    /// Why per-stream: when a player opens an initial-playback connection AND
+    /// a container-metadata connection (Cues at end-of-file) for the same file,
+    /// both poll loops re-assert their wait pieces at libtorrent every 50ms.
+    /// If both use deadline=0, libtorrent's piece picker breaks the tie by
+    /// piece index — and since the Cues piece is at the END of the file, it
+    /// gets sequentially queued *behind* the initial pieces, so it doesn't
+    /// arrive until ~all earlier file pieces finish (observed: ~27 s wait).
+    /// Giving InitialPlayback a small non-zero deadline (50ms) lets the
+    /// ContainerMetadata stream keep deadline=0 win the ordering — the player
+    /// can decode the Cues quickly and start playback while the head pieces
+    /// trickle in normally.
+    pub(crate) wait_deadline_ms: i32,
 }
 
 impl LibtorrentFileStream {
@@ -232,10 +247,13 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 }
             }
 
-            // Try to get from moka cache (check synchronously)
-            if let Some(piece_data) =
-                futures::executor::block_on(self.piece_cache.get_piece(&self.info_hash, piece))
-            {
+            // Try to get from moka cache (sync — does not park the tokio thread).
+            // PLAN-002 Fix 1: previously this used `futures::executor::block_on`
+            // which parks the current tokio worker thread for the duration of
+            // moka's internal segment-lock acquisition. Under load (multiple
+            // concurrent streams polling every 50 ms) this could starve all
+            // worker threads simultaneously, blocking new HTTP requests.
+            if let Some(piece_data) = self.piece_cache.get_piece_sync(&self.info_hash, piece) {
                 self.requested_piece_via_api.remove(&piece);
                 let offset_in_cached = ((self.file_offset + pos) % self.piece_length) as usize;
                 self.cached_piece_data = Some((piece, piece_data.clone(), 0));
@@ -289,10 +307,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                             if next_piece > last_piece {
                                 break;
                             }
-                            if prefetch_cache
-                                .has_piece(&prefetch_info_hash, next_piece)
-                                .await
-                            {
+                            if prefetch_cache.has_piece_sync(&prefetch_info_hash, next_piece) {
                                 continue;
                             }
                             if !prefetch_handle.have_piece(next_piece) {
@@ -321,10 +336,14 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             self.piece_waiter
                 .register(&self.info_hash, piece, cx.waker().clone());
 
-            // Re-assert urgency every wakeup: set priority 7 + deadline 0ms so libtorrent
-            // never deprioritizes this piece after its original deadline expires.
+            // Re-assert urgency every wakeup so libtorrent never deprioritizes
+            // this piece after its original deadline expires. The deadline is
+            // per-stream (`wait_deadline_ms`) so concurrent initial-playback
+            // and container-metadata streams don't all collapse to deadline=0
+            // and force libtorrent into sequential picking by piece index.
+            let wait_deadline = self.wait_deadline_ms;
             self.handle.set_piece_priority(piece, 7);
-            self.handle.set_piece_deadline(piece, 0);
+            self.handle.set_piece_deadline(piece, wait_deadline);
 
             let waker = cx.waker().clone();
             tokio::spawn(async move {

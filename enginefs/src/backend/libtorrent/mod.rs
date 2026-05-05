@@ -210,8 +210,15 @@ impl LibtorrentBackend {
             loop {
                 interval.tick().await;
 
-                let mut s = alert_session.write().await;
-                let alerts = s.pop_alerts();
+                // Hold the session write lock only long enough to drain alerts,
+                // then release it BEFORE doing any FFI work. Otherwise
+                // `get_file_reader` (which needs `session.read()`) is starved
+                // for the entire alert-processing duration and seeks on
+                // incomplete torrents stall while pieces finalize. (PLAN-002 Fix 2)
+                let alerts = {
+                    let mut s = alert_session.write().await;
+                    s.pop_alerts()
+                };
 
                 for alert in alerts {
                     // Log hash failures to detect starvation and bad piece validations
@@ -222,9 +229,10 @@ impl LibtorrentBackend {
                             alert.info_hash,
                             alert.message
                         );
+                        continue;
                     }
 
-                    // Handle piece_finished_alert: read piece data directly from memory storage
+                    // Handle piece_finished_alert: read piece data directly from memory storage.
                     // We bypass libtorrent's read_piece() which fails with custom disk interfaces
                     // due to "invalid piece index in slot list" errors.
                     if alert.alert_type == piece_finished_alert_type && alert.piece_index >= 0 {
@@ -234,7 +242,10 @@ impl LibtorrentBackend {
                             alert.info_hash,
                         );
 
-                        let piece_data = libtorrent_sys::memory_read_piece_for_hash(&alert.info_hash, alert.piece_index);
+                        let piece_data = libtorrent_sys::memory_read_piece_for_hash(
+                            &alert.info_hash,
+                            alert.piece_index,
+                        );
                         if !piece_data.is_empty() {
                             let info_hash = alert.info_hash.clone();
                             let piece_idx = alert.piece_index;
@@ -256,12 +267,13 @@ impl LibtorrentBackend {
                                 alert.piece_index,
                                 alert.info_hash,
                             );
-                        }    // Still notify waiters so they can retry
+                            // Still notify waiters so they can retry the read path.
                             alert_piece_waiter
                                 .notify_piece_finished(&alert.info_hash, alert.piece_index);
                         }
                     }
                 }
+            }
         });
 
         // === SLOW MONITOR ===

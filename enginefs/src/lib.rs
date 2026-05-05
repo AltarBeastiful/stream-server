@@ -235,8 +235,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engines.keys().cloned().collect()
     }
 
-    /// Called when a stream starts for a torrent file
-    /// Implements exclusive single-file downloading - only ONE file downloads at a time
+    /// Called when a stream starts for a torrent file.
+    /// Implements exclusive single-file downloading - only ONE file downloads at a time.
+    ///
+    /// NOTE: We deliberately do NOT cancel previous streams for the same
+    /// `(info_hash, file_idx)`. Players (e.g. Stremio) routinely open two
+    /// concurrent connections to the same file — one for the head bytes
+    /// (offset=0) and one for container metadata at the end (offset≈eof for
+    /// MKV Cues / MP4 moov). Cancelling the first when the second arrives
+    /// makes the player wait for the metadata read to finish before initial
+    /// playback can start, which made initial playback take 27+ seconds.
     pub async fn on_stream_start(&self, info_hash: &str, file_idx: usize) {
         let info_hash = info_hash.to_lowercase();
 
