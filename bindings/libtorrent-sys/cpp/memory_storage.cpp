@@ -437,4 +437,20 @@ rust::Vec<uint8_t> memory_read_piece_for_hash(rust::Str info_hash, int32_t piece
   return result;
 }
 
+// Evict a single piece from the in-memory storage for the given torrent.
+// Called by Rust after the piece has been durably written to the warm disk tier.
+// libtorrent's have_piece() bitfield is NOT affected — the piece remains "verified";
+// only the raw bytes are freed from the C++ std::map.
+void memory_evict_piece_for_hash(rust::Str info_hash, int32_t piece) {
+  std::lock_guard<std::mutex> lock(g_dio_mutex);
+  if (!g_memory_disk_io) return;
+
+  std::string hash_str(info_hash.data(), info_hash.size());
+  auto st = g_memory_disk_io->get_storage_for_hash(hash_str);
+  if (!st) return;
+
+  std::lock_guard<std::mutex> slock(st->mutex);
+  st->pieces.erase(lt::piece_index_t(piece));
+}
+
 } // namespace libtorrent_wrapper

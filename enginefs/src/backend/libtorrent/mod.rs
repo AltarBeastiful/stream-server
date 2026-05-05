@@ -31,8 +31,8 @@ pub struct LibtorrentBackend {
     metadata_path: PathBuf,
     config: crate::backend::BackendConfig,
     stream_counter: Arc<std::sync::atomic::AtomicUsize>,
-    /// In-memory piece cache for fast streaming
-    piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
+    /// Hybrid two-tier piece cache (hot RAM + warm disk flat file)
+    piece_cache: Arc<crate::hybrid_cache::HybridPieceCache>,
     /// Registry of wakers waiting for pieces to finish downloading
     piece_waiter: Arc<crate::piece_waiter::PieceWaiterRegistry>,
 }
@@ -86,14 +86,20 @@ impl LibtorrentBackend {
         let metadata_path = save_path.join(".metadata");
         let _ = std::fs::create_dir_all(&metadata_path);
 
-        // Create piece cache using existing cache settings
-        let piece_cache_config = crate::piece_cache::PieceCacheConfig::from_engine_config(
-            &config.cache,
-            save_path.join(".piece_cache"),
+        // Create hybrid piece cache: bounded hot RAM tier + warm disk flat-file tier.
+        // Hot tier size: 5% of configured cache_size (max 512 MB) so that the warm
+        // tier handles the long tail of a movie download without OOM-ing.
+        let max_hot_bytes = if config.cache.size > 0 {
+            (config.cache.size / 20).min(512 * 1024 * 1024)
+        } else {
+            512 * 1024 * 1024 // Default: 512 MB
+        };
+        let piece_cache = crate::hybrid_cache::HybridPieceCache::new(
+            crate::hybrid_cache::HybridCacheConfig {
+                max_hot_bytes,
+                warm_dir: save_path.join(".warm_cache"),
+            },
         );
-        let piece_cache = Arc::new(crate::piece_cache::PieceCacheManager::new(
-            piece_cache_config,
-        ));
 
         let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
 
@@ -126,14 +132,17 @@ impl LibtorrentBackend {
         let metadata_path = save_path.join(".metadata");
         let _ = std::fs::create_dir_all(&metadata_path);
 
-        // Create piece cache using existing cache settings
-        let piece_cache_config = crate::piece_cache::PieceCacheConfig::from_engine_config(
-            &config.cache,
-            save_path.join(".piece_cache"),
+        let max_hot_bytes = if config.cache.size > 0 {
+            (config.cache.size / 20).min(512 * 1024 * 1024)
+        } else {
+            512 * 1024 * 1024
+        };
+        let piece_cache = crate::hybrid_cache::HybridPieceCache::new(
+            crate::hybrid_cache::HybridCacheConfig {
+                max_hot_bytes,
+                warm_dir: save_path.join(".warm_cache"),
+            },
         );
-        let piece_cache = Arc::new(crate::piece_cache::PieceCacheManager::new(
-            piece_cache_config,
-        ));
 
         let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
 
@@ -203,6 +212,7 @@ impl LibtorrentBackend {
         // when pieces finish without polling or blocking the reader path.
         let alert_session = self.session.clone();
         let alert_piece_waiter = self.piece_waiter.clone();
+        let alert_piece_cache = self.piece_cache.clone();
 
         tokio::spawn(async move {
             // Fetch accurate alert types directly from C++ libtorrent
@@ -248,11 +258,28 @@ impl LibtorrentBackend {
                             alert.piece_index,
                             alert.info_hash,
                         );
-                        // Wake waiting streams. They will read the piece on-demand from
-                        // libtorrent's in-memory storage via memory_read_piece_for_hash.
-                        // We do NOT eagerly copy into the Moka cache here — the stream's
-                        // direct-read path and prefetch task handle that, avoiding a
-                        // redundant 256 KB memcpy + tokio::spawn per piece arrival.
+
+                        // Eagerly copy piece data into the hybrid cache (hot tier).
+                        // This is the single copy per piece that enables bounded memory:
+                        // once in the hot tier, the piece can be evicted to disk when
+                        // the hot tier fills up, freeing both Rust and C++ RAM.
+                        //
+                        // Cost: one memcpy of ~piece_length bytes per piece_finished_alert.
+                        // Benefit: C++ std::map is no longer the authoritative store,
+                        //          so pieces can be freed from C++ after disk writeback.
+                        let piece_data = libtorrent_sys::memory_read_piece_for_hash(
+                            &alert.info_hash,
+                            alert.piece_index,
+                        );
+                        if !piece_data.is_empty() {
+                            alert_piece_cache.put(
+                                &alert.info_hash,
+                                alert.piece_index,
+                                bytes::Bytes::from(piece_data),
+                            );
+                        }
+
+                        // Wake any streams waiting for this piece.
                         alert_piece_waiter
                             .notify_piece_finished(&alert.info_hash, alert.piece_index);
                     }

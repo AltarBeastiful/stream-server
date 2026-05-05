@@ -138,4 +138,10 @@ std::unique_ptr<lt::disk_interface> memory_disk_io_constructor(
 // info_hash hex string). This prevents cross-torrent piece contamination.
 rust::Vec<uint8_t> memory_read_piece_for_hash(rust::Str info_hash, int32_t piece);
 
+// Evict (free) a single piece from the in-memory storage for a specific torrent.
+// Called by the Rust hybrid cache after the piece has been safely written to the
+// warm disk tier. The piece remains verified in libtorrent's bitfield so
+// have_piece() still returns true, but async_read() will return an error for it.
+void memory_evict_piece_for_hash(rust::Str info_hash, int32_t piece);
+
 } // namespace libtorrent_wrapper

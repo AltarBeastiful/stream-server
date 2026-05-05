@@ -13,6 +13,7 @@ pub mod disk_cache;
 pub mod engine;
 pub mod files;
 pub mod hls;
+pub mod hybrid_cache;
 pub mod hwaccel;
 pub mod metadata_cache;
 pub mod piece_cache;

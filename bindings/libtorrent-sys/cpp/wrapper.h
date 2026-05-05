@@ -180,4 +180,8 @@ int32_t get_hash_failed_alert_type();
 // Direct memory piece read — bypasses libtorrent's read_piece()
 rust::Vec<uint8_t> memory_read_piece_for_hash(rust::Str info_hash, int32_t piece);
 
+// Evict (free) a piece from the in-memory C++ storage after it has been persisted
+// to the Rust warm tier. Reduces RSS without affecting libtorrent's bitfield.
+void memory_evict_piece_for_hash(rust::Str info_hash, int32_t piece);
+
 } // namespace libtorrent_wrapper

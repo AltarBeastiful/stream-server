@@ -1,5 +1,6 @@
 //! File stream implementation for libtorrent backend
 
+use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,13 +34,14 @@ pub(crate) struct LibtorrentFileStream {
     pub(crate) bitrate: Option<u64>,
     pub(crate) download_speed_ema: f64,
     pub(crate) stream_id: usize,
-    /// In-memory piece cache for fast streaming
-    pub(crate) piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
+    /// Hybrid piece cache: hot RAM tier + warm disk flat-file tier.
+    pub(crate) piece_cache: Arc<crate::hybrid_cache::HybridPieceCache>,
     /// Info hash for cache lookups
     pub(crate) info_hash: String,
-    /// Currently cached piece data for fast serving
+    /// Currently cached piece data for fast serving (L0 per-stream cache).
+    /// Avoids even a hot-tier lookup for sequential reads within the same piece.
     /// Tuple: (piece_idx, data, file_relative_start)
-    pub(crate) cached_piece_data: Option<(i32, Arc<Vec<u8>>, u64)>,
+    pub(crate) cached_piece_data: Option<(i32, Bytes, u64)>,
     /// Last piece we triggered prefetch for (to avoid repeated requests)
     pub(crate) last_prefetch_piece: i32,
     /// Track pieces we've requested via read_piece() API to avoid duplicate requests
@@ -253,16 +255,13 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 }
             }
 
-            // Try to get from moka cache (sync — does not park the tokio thread).
-            // PLAN-002 Fix 1: previously this used `futures::executor::block_on`
-            // which parks the current tokio worker thread for the duration of
-            // moka's internal segment-lock acquisition. Under load (multiple
-            // concurrent streams polling every 50 ms) this could starve all
-            // worker threads simultaneously, blocking new HTTP requests.
-            if let Some(piece_data) = self.piece_cache.get_piece_sync(&self.info_hash, piece) {
+            // Try to get from the hybrid cache (hot tier then warm tier).
+            // Both lookups are sync and do not park the tokio worker thread.
+            // PLAN-002 Fix 1: previously used `futures::executor::block_on` which
+            // parked the worker thread; now fully sync via moka's sync Cache.
+            if let Some(piece_data) = self.piece_cache.get_sync(&self.info_hash, piece) {
                 self.requested_piece_via_api.remove(&piece);
                 let offset_in_cached = ((self.file_offset + pos) % self.piece_length) as usize;
-                self.cached_piece_data = Some((piece, piece_data.clone(), 0));
 
                 let available = piece_data.len().saturating_sub(offset_in_cached);
                 let to_read = buf.remaining().min(available);
@@ -273,21 +272,24 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                     if !self.first_read_logged {
                         self.first_read_logged = true;
                         tracing::info!(
-                            "startup: first direct-stream bytes ready after {:?} (piece={}, source=piece-cache)",
+                            "startup: first direct-stream bytes ready after {:?} (piece={}, source=hybrid-cache)",
                             self.created_at.elapsed(),
                             piece
                         );
                     }
 
                     tracing::debug!(
-                        "poll_read: Served {} bytes from MOKA cache (piece {}, offset_in_cached={})",
+                        "poll_read: Served {} bytes from hybrid cache (piece {}, offset_in_cached={})",
                         to_read,
                         piece,
                         offset_in_cached
                     );
                 }
 
-                // === READ-AHEAD PREFETCH (memory-only) ===
+                // Store in L0 cache for sequential reads within the same piece.
+                self.cached_piece_data = Some((piece, piece_data, 0));
+
+                // === READ-AHEAD PREFETCH ===
                 if piece != self.last_prefetch_piece {
                     self.last_prefetch_piece = piece;
                     let prefetch_cache = self.piece_cache.clone();
@@ -306,7 +308,9 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                         2
                     };
 
-                    // Spawn background prefetch task (memory-only: read directly from storage)
+                    // Spawn background prefetch task: reads pieces from C++ memory storage
+                    // and inserts them into the hot tier so they're ready before poll_read
+                    // needs them.
                     tokio::spawn(async move {
                         for i in 1..=prefetch_count {
                             let next_piece = piece + i;
@@ -319,12 +323,19 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                             if !prefetch_handle.have_piece(next_piece) {
                                 continue;
                             }
-                            // Read directly from memory storage (no libtorrent read_piece)
-                            let data = libtorrent_sys::memory_read_piece_for_hash(&prefetch_info_hash, next_piece);
+                            // Read directly from C++ memory storage.
+                            let data = libtorrent_sys::memory_read_piece_for_hash(
+                                &prefetch_info_hash,
+                                next_piece,
+                            );
                             if !data.is_empty() {
-                                prefetch_cache.put_piece(&prefetch_info_hash, next_piece, data).await;
+                                prefetch_cache.put(
+                                    &prefetch_info_hash,
+                                    next_piece,
+                                    bytes::Bytes::from(data),
+                                );
                                 tracing::debug!(
-                                    "Read-ahead: cached piece {} directly from memory",
+                                    "Read-ahead: cached piece {} in hybrid hot tier",
                                     next_piece
                                 );
                             }
@@ -431,54 +442,84 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             return std::task::Poll::Pending;
         }
 
-        // Piece is downloaded but not in cache — read directly from memory storage
-        // FAST PATH: serve immediately without any async round-trip
+        // Piece is downloaded but not in cache — read directly from C++ memory storage.
+        // This path is taken when:
+        //   (a) The alert pump hasn't processed piece_finished_alert yet (race window), OR
+        //   (b) The piece was evicted from C++ (returns empty) but is in the warm tier.
         if piece >= 0 && !self.requested_piece_via_api.contains_key(&piece) {
             let piece_data = libtorrent_sys::memory_read_piece_for_hash(&self.info_hash, piece);
             if !piece_data.is_empty() {
                 tracing::debug!(
-                    "poll_read: Direct read piece {} from memory storage ({} bytes)",
+                    "poll_read: Direct read piece {} from C++ memory storage ({} bytes)",
                     piece,
                     piece_data.len()
                 );
 
-                // Serve bytes immediately — no async round-trip needed for completed pieces
+                // Wrap in Bytes (takes ownership, no copy).
+                let piece_bytes = bytes::Bytes::from(piece_data);
+
+                // Serve bytes immediately — no async round-trip needed.
                 let offset_in_cached =
                     ((self.file_offset + pos) % self.piece_length) as usize;
-                let available = piece_data.len().saturating_sub(offset_in_cached);
+                let available = piece_bytes.len().saturating_sub(offset_in_cached);
                 let to_read = buf.remaining().min(available);
                 if to_read > 0 {
                     buf.put_slice(
-                        &piece_data[offset_in_cached..offset_in_cached + to_read],
+                        &piece_bytes[offset_in_cached..offset_in_cached + to_read],
                     );
                     self.current_pos += to_read as u64;
                     if !self.first_read_logged {
                         self.first_read_logged = true;
                         tracing::info!(
-                            "startup: first direct-stream bytes ready after {:?} (piece={}, source=memory-storage)",
+                            "startup: first direct-stream bytes ready after {:?} (piece={}, source=cpp-memory)",
                             self.created_at.elapsed(),
                             piece
                         );
                     }
                 }
 
-                // Store in local cache for subsequent reads of this piece
-                let piece_arc = std::sync::Arc::new(piece_data);
-                self.cached_piece_data = Some((piece, piece_arc.clone(), 0));
                 self.requested_piece_via_api.remove(&piece);
-
-                // Background: persist into Moka cache so the prefetch path can find it.
-                let info_hash = self.info_hash.clone();
-                let cache = self.piece_cache.clone();
-                let piece_data_clone = (*piece_arc).clone();
-                tokio::spawn(async move {
-                    cache.put_piece(&info_hash, piece, piece_data_clone).await;
-                });
+                // Put into the hybrid hot tier (sync, O(1)). This ensures the piece
+                // is tracked for size-based eviction to the warm disk tier.
+                self.piece_cache.put(&self.info_hash, piece, piece_bytes.clone());
+                // Store in L0 per-stream cache for the next sequential read.
+                self.cached_piece_data = Some((piece, piece_bytes, 0));
 
                 return std::task::Poll::Ready(Ok(()));
             } else {
+                // C++ storage returned empty: the piece was evicted from C++ by the
+                // drain task after being persisted to the warm tier. The warm tier
+                // should have it — try the hybrid cache again before waiting.
+                if let Some(warm_data) = self.piece_cache.get_sync(&self.info_hash, piece) {
+                    tracing::debug!(
+                        "poll_read: piece {} served from warm tier after C++ eviction",
+                        piece
+                    );
+                    let offset_in_cached =
+                        ((self.file_offset + pos) % self.piece_length) as usize;
+                    let available = warm_data.len().saturating_sub(offset_in_cached);
+                    let to_read = buf.remaining().min(available);
+                    if to_read > 0 {
+                        buf.put_slice(&warm_data[offset_in_cached..offset_in_cached + to_read]);
+                        self.current_pos += to_read as u64;
+                        if !self.first_read_logged {
+                            self.first_read_logged = true;
+                            tracing::info!(
+                                "startup: first direct-stream bytes ready after {:?} (piece={}, source=warm-tier)",
+                                self.created_at.elapsed(),
+                                piece
+                            );
+                        }
+                    }
+                    self.requested_piece_via_api.remove(&piece);
+                    self.cached_piece_data = Some((piece, warm_data, 0));
+                    return std::task::Poll::Ready(Ok(()));
+                }
+
+                // Piece is in the eviction channel but warm write not yet committed.
+                // Wake in 10 ms to retry.
                 tracing::debug!(
-                    "poll_read: piece {} downloaded but not yet in memory storage",
+                    "poll_read: piece {} not yet in warm tier — waiting 10ms",
                     piece,
                 );
                 self.piece_waiter

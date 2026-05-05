@@ -25,8 +25,8 @@ pub struct LibtorrentTorrentHandle {
     pub(crate) save_path: PathBuf,
     pub(crate) config: crate::backend::BackendConfig,
     pub(crate) stream_counter: Arc<std::sync::atomic::AtomicUsize>,
-    /// In-memory piece cache for fast streaming
-    pub(crate) piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
+    /// Hybrid piece cache: hot RAM tier + warm disk flat-file tier.
+    pub(crate) piece_cache: Arc<crate::hybrid_cache::HybridPieceCache>,
     /// Registry of wakers waiting for pieces to finish downloading
     pub(crate) piece_waiter: Arc<crate::piece_waiter::PieceWaiterRegistry>,
 }
@@ -140,6 +140,11 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         let last_piece = file_info.last_piece;
         let piece_length = handle.piece_length() as u64;
         let global_file_offset = file_info.offset as u64;
+
+        // Register piece_length with the hybrid cache warm tier so it can compute
+        // flat-file slot offsets when evicting pieces. Idempotent — safe to call
+        // on every request (no-op if already registered with the same hash).
+        self.piece_cache.register_torrent(&self.info_hash, piece_length);
 
         // Check if file is already complete by checking pieces in its range
         let mut is_complete = true;
@@ -302,7 +307,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                     // CRITICAL: 300ms for user seeks. Window=8 so pieces ahead are
                     // already in flight when the target arrives — avoids sequential
                     // holes where one slow peer blocks piece N while N+1..N+7 download.
-                    (300, 8, "CRITICAL")
+                    (300, 6, "CRITICAL")
                 }
                 SeekType::ContainerMetadata => {
                     // Container metadata - high priority, small window
@@ -647,7 +652,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                     for i in 0..prewarm_count {
                         let piece_data = libtorrent_sys::memory_read_piece_for_hash(&info_hash, fp + i);
                         if !piece_data.is_empty() {
-                            cache.put_piece(&info_hash, fp + i, piece_data).await;
+                            cache.put(&info_hash, fp + i, bytes::Bytes::from(piece_data));
                             waiter.notify_piece_finished(&info_hash, fp + i);
                         }
                     }

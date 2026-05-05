@@ -477,6 +477,11 @@ mod ffi {
         /// identified by its info_hash. This avoids cross-torrent contamination
         /// when multiple torrents share the same piece index.
         fn memory_read_piece_for_hash(info_hash: &str, piece: i32) -> Vec<u8>;
+
+        /// Evict (free) a single piece from the C++ in-memory storage after it has
+        /// been durably written to the Rust warm disk tier. libtorrent's bitfield
+        /// is unaffected; only the raw bytes are freed to reduce RSS.
+        fn memory_evict_piece_for_hash(info_hash: &str, piece: i32);
     }
 }
 
