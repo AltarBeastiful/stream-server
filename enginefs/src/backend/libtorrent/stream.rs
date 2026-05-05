@@ -353,7 +353,11 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
 
             let waker = cx.waker().clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // Safety-net fallback: if piece_waiter notification is missed (e.g.
+                // due to a race between have_piece() and register()), wake again
+                // after 500ms so we don't stall forever.  The piece_waiter handles
+                // the fast path (wakes immediately on piece_finished_alert).
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 waker.wake();
             });
 
@@ -432,7 +436,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
         if piece >= 0 && !self.requested_piece_via_api.contains_key(&piece) {
             let piece_data = libtorrent_sys::memory_read_piece_for_hash(&self.info_hash, piece);
             if !piece_data.is_empty() {
-                tracing::info!(
+                tracing::debug!(
                     "poll_read: Direct read piece {} from memory storage ({} bytes)",
                     piece,
                     piece_data.len()
@@ -463,14 +467,12 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 self.cached_piece_data = Some((piece, piece_arc.clone(), 0));
                 self.requested_piece_via_api.remove(&piece);
 
-                // Background: persist into moka cache for future prefetch lookups
+                // Background: persist into Moka cache so the prefetch path can find it.
                 let info_hash = self.info_hash.clone();
                 let cache = self.piece_cache.clone();
-                let waiter = self.piece_waiter.clone();
                 let piece_data_clone = (*piece_arc).clone();
                 tokio::spawn(async move {
                     cache.put_piece(&info_hash, piece, piece_data_clone).await;
-                    waiter.notify_piece_finished(&info_hash, piece);
                 });
 
                 return std::task::Poll::Ready(Ok(()));

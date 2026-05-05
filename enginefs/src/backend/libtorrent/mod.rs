@@ -197,36 +197,41 @@ impl LibtorrentBackend {
         }
     }
     fn start_monitor_task(&self) {
-        // === FAST ALERT PUMP ===
-        // Process alerts every 5ms for minimal latency on piece notifications
-        // This is CRITICAL for streaming - wakes waiting streams immediately when pieces finish
+        // === ALERT PUMP ===
+        // Event-driven: peek for alerts under a read lock; only upgrade to write
+        // lock when alerts are actually queued. Wakes waiting streams immediately
+        // when pieces finish without polling or blocking the reader path.
         let alert_session = self.session.clone();
-        let alert_piece_cache = self.piece_cache.clone();
         let alert_piece_waiter = self.piece_waiter.clone();
 
         tokio::spawn(async move {
-            // REDUCED to 5ms for instant piece notifications
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
-
             // Fetch accurate alert types directly from C++ libtorrent
             let piece_finished_alert_type = libtorrent_sys::get_piece_finished_alert_type();
             let hash_failed_alert_type = libtorrent_sys::get_hash_failed_alert_type();
 
             loop {
-                interval.tick().await;
+                // Peek for alerts under a cheap READ lock before taking the WRITE lock.
+                // wait_for_alert(0) is non-blocking: returns true only if an alert is
+                // already queued. This eliminates ~50 unnecessary write-lock acquisitions/sec
+                // during idle periods (e.g. when buffering between playback requests).
+                let has_alerts = {
+                    let s = alert_session.read().await;
+                    s.wait_for_alert(0)
+                };
 
-                // Hold the session write lock only long enough to drain alerts,
-                // then release it BEFORE doing any FFI work. Otherwise
-                // `get_file_reader` (which needs `session.read()`) is starved
-                // for the entire alert-processing duration and seeks on
-                // incomplete torrents stall while pieces finalize. (PLAN-002 Fix 2)
+                if !has_alerts {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    continue;
+                }
+
+                // Alerts available: hold the write lock only long enough to drain the queue,
+                // then release it BEFORE doing any work. (PLAN-002 Fix 2)
                 let alerts = {
                     let mut s = alert_session.write().await;
                     s.pop_alerts()
                 };
 
                 for alert in alerts {
-                    // Log hash failures to detect starvation and bad piece validations
                     if alert.alert_type == hash_failed_alert_type {
                         tracing::error!(
                             "hash_failed_alert piece={} info_hash={} message={}",
@@ -237,45 +242,19 @@ impl LibtorrentBackend {
                         continue;
                     }
 
-                    // Handle piece_finished_alert: read piece data directly from memory storage.
-                    // We bypass libtorrent's read_piece() which fails with custom disk interfaces
-                    // due to "invalid piece index in slot list" errors.
                     if alert.alert_type == piece_finished_alert_type && alert.piece_index >= 0 {
-                        tracing::info!(
-                            "piece_finished_alert piece={} info_hash={}",
+                        tracing::debug!(
+                            "piece_finished piece={} info_hash={}",
                             alert.piece_index,
                             alert.info_hash,
                         );
-
-                        let piece_data = libtorrent_sys::memory_read_piece_for_hash(
-                            &alert.info_hash,
-                            alert.piece_index,
-                        );
-                        if !piece_data.is_empty() {
-                            let info_hash = alert.info_hash.clone();
-                            let piece_idx = alert.piece_index;
-                            let cache = alert_piece_cache.clone();
-                            let waiter = alert_piece_waiter.clone();
-
-                            tokio::spawn(async move {
-                                cache.put_piece(&info_hash, piece_idx, piece_data).await;
-                                waiter.notify_piece_finished(&info_hash, piece_idx);
-                                tracing::info!(
-                                    "Direct-read: Cached piece {} for {}",
-                                    piece_idx,
-                                    info_hash
-                                );
-                            });
-                        } else {
-                            tracing::warn!(
-                                "piece_finished_alert: memory_read_piece_for_hash returned empty for piece={} info_hash={}",
-                                alert.piece_index,
-                                alert.info_hash,
-                            );
-                            // Still notify waiters so they can retry the read path.
-                            alert_piece_waiter
-                                .notify_piece_finished(&alert.info_hash, alert.piece_index);
-                        }
+                        // Wake waiting streams. They will read the piece on-demand from
+                        // libtorrent's in-memory storage via memory_read_piece_for_hash.
+                        // We do NOT eagerly copy into the Moka cache here — the stream's
+                        // direct-read path and prefetch task handle that, avoiding a
+                        // redundant 256 KB memcpy + tokio::spawn per piece arrival.
+                        alert_piece_waiter
+                            .notify_piece_finished(&alert.info_hash, alert.piece_index);
                     }
                 }
             }
