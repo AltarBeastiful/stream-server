@@ -315,15 +315,23 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 (base_deadline as f64 * speed_factor) as i32
             };
 
-            tracing::info!(
-                "get_file_reader: {} - {} pieces from piece {} (deadlines {}ms+, speed={:.1}MB/s, just_resumed={})",
-                label,
-                window_size,
-                actual_start_piece,
-                adjusted_deadline,
-                download_speed as f64 / 1_000_000.0,
-                was_just_resumed
-            );
+            {
+                // Log piece availability for the target piece — critical for debugging
+                // container-metadata waits (e.g. MKV Cues at end of file).
+                let have_target = handle.have_piece(actual_start_piece);
+                let status_for_log = handle.status();
+                tracing::info!(
+                    "get_file_reader: {} - {} pieces from piece {} (deadlines {}ms+, speed={:.1}MB/s, peers={}, just_resumed={}, have_target_piece={})",
+                    label,
+                    window_size,
+                    actual_start_piece,
+                    adjusted_deadline,
+                    download_speed as f64 / 1_000_000.0,
+                    status_for_log.num_peers,
+                    was_just_resumed,
+                    have_target,
+                );
+            }
 
             // Set piece PRIORITY and DEADLINE with staircase pattern.
             // PLAN-001 Bug 2: for UserScrub the *first* piece always gets a 0ms
@@ -448,6 +456,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             created_at: std::time::Instant::now(),
             first_read_logged: false,
             first_wait_logged: false,
+            last_wait_log: None,
         }))
     }
 

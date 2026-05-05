@@ -56,6 +56,9 @@ pub(crate) struct LibtorrentFileStream {
     pub(crate) first_read_logged: bool,
     /// Whether we already logged the first startup wait
     pub(crate) first_wait_logged: bool,
+    /// Last time we emitted a periodic "still waiting for piece" log line.
+    /// Allows time-based throttling regardless of position alignment.
+    pub(crate) last_wait_log: Option<Instant>,
     /// Deadline (ms in the future) used by the wait loop in `poll_read` when
     /// re-asserting urgency on a piece. Lower = more urgent.
     ///
@@ -351,29 +354,40 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 waker.wake();
             });
 
-            if pos % (1024 * 1024) == 0 {
+            // Log on first wait regardless of position, and then every 2 seconds.
+            // Previously only fired when pos%1MB==0 or pos==0, which meant
+            // ContainerMetadata waits (e.g. MKV Cues at pos=244996) were silent
+            // for their entire duration.
+            let now = std::time::Instant::now();
+            let should_log = !self.first_wait_logged
+                || self.last_wait_log.map_or(true, |t| now.duration_since(t).as_secs() >= 2);
+            if should_log {
                 let status = self.handle.status();
-                tracing::info!(
-                    "poll_read: WAITING for piece {} (pos={}, peers={}, speed={:.1}MB/s, paused={}, finished={})",
-                    piece,
-                    pos,
-                    status.num_peers,
-                    status.download_rate as f64 / 1_000_000.0,
-                    status.is_paused,
-                    status.is_finished
-                );
-            }
-            if pos == 0 && !self.first_wait_logged {
-                self.first_wait_logged = true;
-                let status = self.handle.status();
-                tracing::info!(
-                    "startup: waiting for first playable piece {} after {:?} (peers={}, paused={}, finished={})",
-                    piece,
-                    self.created_at.elapsed(),
-                    status.num_peers,
-                    status.is_paused,
-                    status.is_finished
-                );
+                if !self.first_wait_logged {
+                    self.first_wait_logged = true;
+                    tracing::info!(
+                        "poll_read: FIRST WAIT for piece {} ({:?}, pos={}, peers={}, speed={:.1}MB/s, paused={}, wait_deadline={}ms)",
+                        piece,
+                        self.seek_type,
+                        pos,
+                        status.num_peers,
+                        status.download_rate as f64 / 1_000_000.0,
+                        status.is_paused,
+                        self.wait_deadline_ms,
+                    );
+                } else {
+                    tracing::info!(
+                        "poll_read: STILL WAITING for piece {} ({:?}, elapsed={:.1}s, pos={}, peers={}, speed={:.1}MB/s, paused={})",
+                        piece,
+                        self.seek_type,
+                        self.created_at.elapsed().as_secs_f64(),
+                        pos,
+                        status.num_peers,
+                        status.download_rate as f64 / 1_000_000.0,
+                        status.is_paused,
+                    );
+                }
+                self.last_wait_log = Some(now);
             }
 
             return std::task::Poll::Pending;
