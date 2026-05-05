@@ -178,6 +178,6 @@ int32_t get_metadata_received_alert_type();
 int32_t get_hash_failed_alert_type();
 
 // Direct memory piece read — bypasses libtorrent's read_piece()
-rust::Vec<uint8_t> memory_read_piece_direct(int32_t piece);
+rust::Vec<uint8_t> memory_read_piece_for_hash(rust::Str info_hash, int32_t piece);
 
 } // namespace libtorrent_wrapper

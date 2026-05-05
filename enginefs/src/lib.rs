@@ -35,7 +35,7 @@ const ENGINE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 
-fn elapsed_secs() -> i64 {
+pub(crate) fn elapsed_secs() -> i64 {
     START_TIME.get_or_init(Instant::now).elapsed().as_secs() as i64
 }
 

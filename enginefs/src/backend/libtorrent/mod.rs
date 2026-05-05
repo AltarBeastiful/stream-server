@@ -234,7 +234,7 @@ impl LibtorrentBackend {
                             alert.info_hash,
                         );
 
-                        let piece_data = libtorrent_sys::memory_read_piece_direct(alert.piece_index);
+                        let piece_data = libtorrent_sys::memory_read_piece_for_hash(&alert.info_hash, alert.piece_index);
                         if !piece_data.is_empty() {
                             let info_hash = alert.info_hash.clone();
                             let piece_idx = alert.piece_index;
@@ -252,7 +252,7 @@ impl LibtorrentBackend {
                             });
                         } else {
                             tracing::warn!(
-                                "piece_finished_alert: memory_read_piece_direct returned empty for piece={} info_hash={}",
+                                "piece_finished_alert: memory_read_piece_for_hash returned empty for piece={} info_hash={}",
                                 alert.piece_index,
                                 alert.info_hash,
                             );

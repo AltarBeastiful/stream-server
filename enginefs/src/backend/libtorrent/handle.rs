@@ -589,7 +589,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 let fp = first_piece;
                 tokio::spawn(async move {
                     for i in 0..prewarm_count {
-                        let piece_data = libtorrent_sys::memory_read_piece_direct(fp + i);
+                        let piece_data = libtorrent_sys::memory_read_piece_for_hash(&info_hash, fp + i);
                         if !piece_data.is_empty() {
                             cache.put_piece(&info_hash, fp + i, piece_data).await;
                             waiter.notify_piece_finished(&info_hash, fp + i);

@@ -19,6 +19,8 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace lt = libtorrent;
@@ -27,6 +29,7 @@ namespace libtorrent_wrapper {
 
 // Per-torrent in-memory storage
 struct memory_torrent_storage {
+    std::string info_hash;  // hex info-hash, for reverse-lookup on remove
     lt::file_storage files;
     int piece_length = 0;
     int num_pieces = 0;
@@ -110,11 +113,13 @@ private:
 
 public:
     std::vector<std::shared_ptr<memory_torrent_storage>> get_all_storages();
+    std::shared_ptr<memory_torrent_storage> get_storage_for_hash(const std::string& info_hash);
     
     lt::io_context& m_ioc;
     lt::counters& m_counters;
     
     std::map<lt::storage_index_t, std::shared_ptr<memory_torrent_storage>> m_torrents;
+    std::unordered_map<std::string, lt::storage_index_t> m_hash_to_storage;
     std::mutex m_mutex;
     lt::storage_index_t m_next_storage_index{0};
     
@@ -129,8 +134,8 @@ std::unique_ptr<lt::disk_interface> memory_disk_io_constructor(
     lt::settings_interface const& settings,
     lt::counters& counters);
 
-// Direct memory piece read — bypasses libtorrent's read_piece() which
-// fails with custom disk interfaces due to slot list validation.
-rust::Vec<uint8_t> memory_read_piece_direct(int32_t piece);
+// Read piece data from memory storage for a specific torrent (identified by
+// info_hash hex string). This prevents cross-torrent piece contamination.
+rust::Vec<uint8_t> memory_read_piece_for_hash(rust::Str info_hash, int32_t piece);
 
 } // namespace libtorrent_wrapper

@@ -469,9 +469,10 @@ mod ffi {
         fn get_metadata_received_alert_type() -> i32;
         fn get_hash_failed_alert_type() -> i32;
 
-        /// Read piece data directly from memory storage, bypassing libtorrent's
-        /// internal read_piece() which fails with custom disk interfaces.
-        fn memory_read_piece_direct(piece: i32) -> Vec<u8>;
+        /// Read piece data directly from memory storage for a specific torrent,
+        /// identified by its info_hash. This avoids cross-torrent contamination
+        /// when multiple torrents share the same piece index.
+        fn memory_read_piece_for_hash(info_hash: &str, piece: i32) -> Vec<u8>;
     }
 }
 

@@ -114,37 +114,65 @@ fn detect_format(content: &str) -> SubFormat {
 fn parse_srt(content: &str) -> Vec<SubtitleCue> {
     let mut cues = Vec::new();
 
-    // SRT block pattern: index, timestamp line, text lines
-    let block_pattern = Regex::new(
-        r"(?m)^\d+\s*\r?\n(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*\r?\n([\s\S]*?)(?=\r?\n\r?\n\d+\s*\r?\n|\r?\n\r?\n*$|$)"
+    // Match the timestamp line of each block (no lookaheads needed)
+    let timestamp_re = Regex::new(
+        r"^(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})"
     ).unwrap();
 
-    for caps in block_pattern.captures_iter(content) {
-        let start_ms = parse_time_components(
-            caps.get(1).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(2).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(3).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(4).map(|m| m.as_str()).unwrap_or("0"),
-        );
+    // Normalize CRLF and split into blocks on blank lines
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    for block in normalized.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
 
-        let end_ms = parse_time_components(
-            caps.get(5).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(6).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(7).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(8).map(|m| m.as_str()).unwrap_or("0"),
-        );
+        let lines: Vec<&str> = block.lines().collect();
+        if lines.len() < 2 {
+            continue;
+        }
 
-        let text = caps.get(9).map(|m| m.as_str()).unwrap_or("").trim();
+        // First line may be a cue number; second (or first) line is the timestamp
+        let (ts_idx, text_start) = if lines[0].trim().parse::<u64>().is_ok() {
+            (1, 2)
+        } else {
+            (0, 1)
+        };
 
-        // Parse inline SRT styling tags
-        let (clean_text, style) = parse_srt_styling(text);
+        if ts_idx >= lines.len() {
+            continue;
+        }
 
-        cues.push(SubtitleCue {
-            start_ms,
-            end_ms,
-            text: clean_text,
-            style,
-        });
+        if let Some(caps) = timestamp_re.captures(lines[ts_idx]) {
+            let start_ms = parse_time_components(
+                caps.get(1).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(2).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(3).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(4).map(|m| m.as_str()).unwrap_or("0"),
+            );
+            let end_ms = parse_time_components(
+                caps.get(5).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(6).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(7).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(8).map(|m| m.as_str()).unwrap_or("0"),
+            );
+
+            let text = if text_start < lines.len() {
+                lines[text_start..].join("\n")
+            } else {
+                String::new()
+            };
+
+            // Parse inline SRT styling tags
+            let (clean_text, style) = parse_srt_styling(text.trim());
+
+            cues.push(SubtitleCue {
+                start_ms,
+                end_ms,
+                text: clean_text,
+                style,
+            });
+        }
     }
 
     cues
@@ -195,39 +223,58 @@ fn parse_ass(content: &str) -> Vec<SubtitleCue> {
 fn parse_vtt(content: &str) -> Vec<SubtitleCue> {
     let mut cues = Vec::new();
 
-    // VTT timestamp pattern
-    let cue_pattern = Regex::new(
-        r"(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})[^\n]*\n([\s\S]*?)(?=\n\n|\n*$)"
+    // Match the timestamp line of each cue (no lookaheads needed)
+    let timestamp_re = Regex::new(
+        r"^(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})"
     ).unwrap();
 
-    for caps in cue_pattern.captures_iter(content) {
-        let start_ms = parse_time_components(
-            caps.get(1).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(2).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(3).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(4).map(|m| m.as_str()).unwrap_or("0"),
-        );
+    // Normalize CRLF and split into blocks on blank lines
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    for block in normalized.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() || block.starts_with("WEBVTT") || block.starts_with("NOTE") {
+            continue;
+        }
 
-        let end_ms = parse_time_components(
-            caps.get(5).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(6).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(7).map(|m| m.as_str()).unwrap_or("0"),
-            caps.get(8).map(|m| m.as_str()).unwrap_or("0"),
-        );
+        let lines: Vec<&str> = block.lines().collect();
+        if lines.is_empty() {
+            continue;
+        }
 
-        let text = caps
-            .get(9)
-            .map(|m| m.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        // Find the timestamp line (may be preceded by an optional cue identifier)
+        let ts_line_idx = match lines.iter().position(|l| timestamp_re.is_match(l)) {
+            Some(idx) => idx,
+            None => continue,
+        };
 
-        cues.push(SubtitleCue {
-            start_ms,
-            end_ms,
-            text,
-            style: None,
-        });
+        if let Some(caps) = timestamp_re.captures(lines[ts_line_idx]) {
+            let start_ms = parse_time_components(
+                caps.get(1).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(2).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(3).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(4).map(|m| m.as_str()).unwrap_or("0"),
+            );
+            let end_ms = parse_time_components(
+                caps.get(5).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(6).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(7).map(|m| m.as_str()).unwrap_or("0"),
+                caps.get(8).map(|m| m.as_str()).unwrap_or("0"),
+            );
+
+            let text_start = ts_line_idx + 1;
+            let text = if text_start < lines.len() {
+                lines[text_start..].join("\n").trim().to_string()
+            } else {
+                String::new()
+            };
+
+            cues.push(SubtitleCue {
+                start_ms,
+                end_ms,
+                text,
+                style: None,
+            });
+        }
     }
 
     cues

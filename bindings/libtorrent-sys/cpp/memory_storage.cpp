@@ -9,6 +9,7 @@
 #include <openssl/sha.h>
 
 #include <cstring>
+#include <sstream>
 
 #include "rust/cxx.h"
 #include "libtorrent-sys/src/lib.rs.h"
@@ -56,16 +57,28 @@ memory_disk_io::new_torrent(lt::storage_params const &p,
   storage->piece_length = p.files.piece_length();
   storage->num_pieces = p.files.num_pieces();
 
+  // Record info_hash for this storage so we can look it up by hash later
+  std::stringstream ss;
+  ss << p.info_hash;
+  storage->info_hash = ss.str();
+
   std::lock_guard<std::mutex> lock(m_mutex);
   lt::storage_index_t const idx = m_next_storage_index++;
   m_torrents[idx] = storage;
+  if (!storage->info_hash.empty()) {
+    m_hash_to_storage[storage->info_hash] = idx;
+  }
 
   return lt::storage_holder(idx, *this);
 }
 
 void memory_disk_io::remove_torrent(lt::storage_index_t idx) {
   std::lock_guard<std::mutex> lock(m_mutex);
-  m_torrents.erase(idx);
+  auto it = m_torrents.find(idx);
+  if (it != m_torrents.end()) {
+    m_hash_to_storage.erase(it->second->info_hash);
+    m_torrents.erase(it);
+  }
 }
 
 std::shared_ptr<memory_torrent_storage>
@@ -84,6 +97,15 @@ memory_disk_io::get_all_storages() {
     result.push_back(st);
   }
   return result;
+}
+
+std::shared_ptr<memory_torrent_storage>
+memory_disk_io::get_storage_for_hash(const std::string& info_hash) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  auto hit = m_hash_to_storage.find(info_hash);
+  if (hit == m_hash_to_storage.end()) return nullptr;
+  auto it = m_torrents.find(hit->second);
+  return it != m_torrents.end() ? it->second : nullptr;
 }
 
 // ============================================================================
@@ -387,28 +409,27 @@ memory_disk_io_constructor(lt::io_context &ioc,
   return std::make_unique<memory_disk_io>(ioc, counters);
 }
 
-rust::Vec<uint8_t> memory_read_piece_direct(int32_t piece) {
+rust::Vec<uint8_t> memory_read_piece_for_hash(rust::Str info_hash, int32_t piece) {
   rust::Vec<uint8_t> result;
   std::lock_guard<std::mutex> lock(g_dio_mutex);
   if (!g_memory_disk_io) return result;
 
-  auto storages = g_memory_disk_io->get_all_storages();
-  for (auto& st : storages) {
-    std::lock_guard<std::mutex> slock(st->mutex);
-    auto it = st->pieces.find(lt::piece_index_t(piece));
-    if (it != st->pieces.end()) {
-      auto const& data = it->second;
-      result.reserve(data.size());
-      // Bulk copy using heap buffer to avoid stack issues with 8MB+ pieces
-      auto* buf = new uint8_t[data.size()];
-      std::memcpy(buf, data.data(), data.size());
-      for (size_t i = 0; i < data.size(); i++) {
-        result.push_back(buf[i]);
-      }
-      delete[] buf;
-      return result;
-    }
+  std::string hash_str(info_hash.data(), info_hash.size());
+  auto st = g_memory_disk_io->get_storage_for_hash(hash_str);
+  if (!st) return result;
+
+  std::lock_guard<std::mutex> slock(st->mutex);
+  auto it = st->pieces.find(lt::piece_index_t(piece));
+  if (it == st->pieces.end()) return result;
+
+  auto const& data = it->second;
+  result.reserve(data.size());
+  auto* buf = new uint8_t[data.size()];
+  std::memcpy(buf, data.data(), data.size());
+  for (size_t i = 0; i < data.size(); i++) {
+    result.push_back(buf[i]);
   }
+  delete[] buf;
   return result;
 }
 

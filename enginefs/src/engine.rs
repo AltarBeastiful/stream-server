@@ -1,5 +1,6 @@
 use crate::backend::{EngineStats, PeerStat, SubtitleTrack, TorrentHandle};
 use crate::cache::DataCache;
+use crate::elapsed_secs;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ pub struct Engine<H: TorrentHandle> {
 
 impl<H: TorrentHandle> Engine<H> {
     pub fn new_with_handle(handle: H, info_hash: &str) -> Self {
-        let now_unix_timestamp = Instant::now().elapsed().as_secs() as i64;
+        let now_unix_timestamp = elapsed_secs();
 
         Self {
             info_hash: info_hash.to_string(),
@@ -170,7 +171,7 @@ impl<H: TorrentHandle> Engine<H> {
 
     pub async fn get_statistics(&self) -> EngineStats {
         self.last_accessed
-            .store(Instant::now().elapsed().as_secs() as i64, Ordering::SeqCst);
+            .store(elapsed_secs(), Ordering::SeqCst);
         let mut stats = self.handle.stats().await;
 
         let guessed_file_idx = self.guess_file_index(None).await.unwrap_or(0);
@@ -217,7 +218,7 @@ impl<H: TorrentHandle> Engine<H> {
         );
 
         self.last_accessed
-            .store(Instant::now().elapsed().as_secs() as i64, Ordering::SeqCst);
+            .store(elapsed_secs(), Ordering::SeqCst);
 
         let files = self.handle.get_files().await;
         if file_idx >= files.len() {

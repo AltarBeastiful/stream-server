@@ -298,7 +298,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                                 continue;
                             }
                             // Read directly from memory storage (no libtorrent read_piece)
-                            let data = libtorrent_sys::memory_read_piece_direct(next_piece);
+                            let data = libtorrent_sys::memory_read_piece_for_hash(&prefetch_info_hash, next_piece);
                             if !data.is_empty() {
                                 prefetch_cache.put_piece(&prefetch_info_hash, next_piece, data).await;
                                 tracing::debug!(
@@ -356,7 +356,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
 
         // Piece is downloaded but not in cache — read directly from memory storage
         if piece >= 0 && !self.requested_piece_via_api.contains_key(&piece) {
-            let piece_data = libtorrent_sys::memory_read_piece_direct(piece);
+            let piece_data = libtorrent_sys::memory_read_piece_for_hash(&self.info_hash, piece);
             if !piece_data.is_empty() {
                 // Got data directly! Cache it and serve immediately on next poll.
                 let info_hash = self.info_hash.clone();
@@ -401,7 +401,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                     "poll_read: piece {} still missing from cache after 250ms, re-reading from memory",
                     piece
                 );
-                let piece_data = libtorrent_sys::memory_read_piece_direct(piece);
+                let piece_data = libtorrent_sys::memory_read_piece_for_hash(&self.info_hash, piece);
                 if !piece_data.is_empty() {
                     let info_hash = self.info_hash.clone();
                     let cache = self.piece_cache.clone();
