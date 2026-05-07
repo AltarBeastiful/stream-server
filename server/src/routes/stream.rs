@@ -262,19 +262,43 @@ pub async fn stream_video(
     };
     let start_offset_hint = start;
 
-    // Parse priority from enginefs-prio header
-    let priority: u8 = if let Some(prio_val) = headers.get("enginefs-prio") {
-        prio_val.to_str().unwrap_or("1").parse().unwrap_or(1)
+    // Parse priority from enginefs-prio header.
+    // Absent header → 1 (normal streaming, seek_type drives deadlines).
+    // Value 10 → hash probe (OpenSubtitles, Stremio hash computation) — must
+    //            not compete with playback streams for libtorrent piece-picker
+    //            slots; served from cache tiers only with low-priority waiting.
+    let (priority, is_probe) = if let Some(prio_val) = headers.get("enginefs-prio") {
+        let p: u8 = prio_val.to_str().unwrap_or("1").parse().unwrap_or(1);
+        let probe = p == 10;
+        if probe {
+            tracing::info!(
+                "stream_video: enginefs-prio={} [HASH PROBE] info_hash={} idx={} range={}-{}",
+                p,
+                info_hash,
+                idx,
+                start,
+                end,
+            );
+        } else {
+            tracing::debug!(
+                "stream_video: enginefs-prio={} info_hash={} idx={}",
+                p,
+                info_hash,
+                idx,
+            );
+        }
+        (p, probe)
     } else {
-        1
+        (1u8, false)
     };
 
     // Await the async get_file
     tracing::debug!(
-        "stream_video: Calling get_file({}) with offset {} and priority {}",
+        "stream_video: Calling get_file({}) with offset {} priority {} is_probe={}",
         idx,
         start_offset_hint,
-        priority
+        priority,
+        is_probe,
     );
     if let Some(mut file) = engine.get_file(idx, start_offset_hint, priority).await {
         tracing::debug!(
@@ -348,11 +372,14 @@ pub async fn stream_video(
         let body = Body::from_stream(guarded_stream);
 
         tracing::info!(
-            "startup: direct stream response ready in {:?} (range {}-{}, partial={})",
+            "startup: direct stream response ready in {:?} \
+             (range {}-{}, partial={}, prio={}{})",
             request_start.elapsed(),
             start,
             end,
-            is_partial
+            is_partial,
+            priority,
+            if is_probe { " [probe]" } else { "" },
         );
 
         if is_partial {

@@ -134,6 +134,8 @@ async fn run_server(
             bt_min_peers_for_stable: settings.bt_min_peers_for_stable,
             bt_request_timeout: settings.bt_request_timeout,
         },
+        stream_inactivity_pause_secs: 30,
+        stream_inactivity_remove_secs: 60,
     };
 
     // EngineFS::new_with_storage() passes tracker storage for persistence.

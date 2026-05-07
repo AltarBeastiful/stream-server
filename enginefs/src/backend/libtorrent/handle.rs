@@ -180,8 +180,17 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         let actual_start_piece: i32;
 
         // PRIORITY 255 = Internal reader (e.g., metadata inspection)
-        // These should NOT modify piece priorities as they would conflict with playback
-        let skip_prioritization = priority == 255 || is_complete;
+        // PRIORITY 10  = Hash probe (enginefs-prio: 10) — serves from cache tiers only,
+        //               must NOT set piece deadlines or it steals slots from real streams.
+        //
+        // The hash probe is sent by Stremio UI to compute the OpenSubtitles movie hash:
+        // two 64KB reads at byte 0 and (file_size - 65536). These almost always hit
+        // already-downloaded pieces (head and tail are fetched early for metadata), so
+        // the correct behaviour is: look in cache tiers immediately; if the piece is not
+        // yet downloaded, wait patiently at very low libtorrent priority (don't compete).
+        let is_probe = priority == 10;
+        let is_internal = priority == 255;
+        let skip_prioritization = is_internal || is_probe || is_complete;
 
         // File size is needed for both prioritization and seek type detection
         let file_size = file_info.size as u64;
@@ -402,12 +411,15 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 }
             }
         } else {
-            // Skip prioritization for internal readers or complete files
+            // Skip prioritization for internal readers, hash probes, or complete files
             actual_start_piece = prelim_start_piece;
             tracing::debug!(
-                "get_file_reader: Skipping prioritization (priority={}, is_complete={})",
+                "get_file_reader: Skipping prioritization \
+                 (priority={}, is_probe={}, is_complete={}, seek={:?})",
                 priority,
-                is_complete
+                is_probe,
+                is_complete,
+                seek_type,
             );
         }
 
@@ -431,10 +443,18 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         // its head window. The InitialPlayback stream uses a small non-zero
         // deadline (50ms) — still well within "urgent" but enough to let the
         // sibling streams' deadline=0 pieces sort first.
-        let wait_deadline_ms: i32 = match seek_type {
-            SeekType::InitialPlayback => 50,
-            SeekType::ContainerMetadata => 0,
-            SeekType::UserScrub => 0,
+        //
+        // Hash probes (is_probe=true) use a very long deadline (5000ms) so they
+        // never steal urgency from real streams. If the piece is not yet downloaded,
+        // the probe waits patiently at low priority rather than competing.
+        let wait_deadline_ms: i32 = if is_probe {
+            5000
+        } else {
+            match seek_type {
+                SeekType::InitialPlayback => 50,
+                SeekType::ContainerMetadata => 0,
+                SeekType::UserScrub => 0,
+            }
         };
 
         Ok(Box::new(LibtorrentFileStream {
@@ -465,6 +485,8 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             first_wait_logged: false,
             last_wait_log: None,
             last_deadline_reset_at: None,
+            is_probe,
+            request_priority: priority,
         }))
     }
 

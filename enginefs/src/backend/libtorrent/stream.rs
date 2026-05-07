@@ -79,12 +79,41 @@ pub(crate) struct LibtorrentFileStream {
     /// can decode the Cues quickly and start playback while the head pieces
     /// trickle in normally.
     pub(crate) wait_deadline_ms: i32,
+    /// True when this stream originated from a `enginefs-prio: 10` request
+    /// (OpenSubtitles hash probe or similar background metadata fetch).
+    ///
+    /// Probe streams:
+    ///   • Do NOT set piece deadlines / priorities — they must not compete with
+    ///     the real playback streams for libtorrent's piece picker slots.
+    ///   • Use a very low libtorrent piece priority (1) and a long deadline
+    ///     (5000 ms) if they DO have to wait for an undownloaded piece.
+    ///   • Skip the L0 per-stream piece cache (`cached_piece_data`) and go
+    ///     directly to the shared hybrid cache tiers, since probe reads are at
+    ///     non-sequential offsets that won't benefit from the sequential shortcut.
+    ///   • Their stuck-piece nudge is also disabled to avoid re-asserting
+    ///     urgency on hash-probe pieces.
+    pub(crate) is_probe: bool,
+    /// Raw `enginefs-prio` header value passed in on this request.
+    /// `1` (default) means no header was present (normal playback).
+    /// `10` means OpenSubtitles hash probe.
+    /// `255` means internal/metadata reader.
+    /// Stored for log attribution so probe requests are identifiable.
+    pub(crate) request_priority: u8,
 }
 
 impl LibtorrentFileStream {
     fn set_priorities(&mut self, pos: u64) {
-        // Skip if already complete
+        // Skip if already complete — all pieces are in memory, no scheduling needed.
         if self.is_complete {
+            return;
+        }
+
+        // Skip for hash probes (enginefs-prio: 10).
+        // Probe streams must not set piece deadlines: they read non-sequential
+        // offsets (head 64KB and tail 64KB) that don't represent actual playback
+        // position. Setting deadlines here would steal piece-picker slots from
+        // real streaming sessions and delay container-metadata fetches.
+        if self.is_probe {
             return;
         }
 
@@ -214,8 +243,12 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             -1
         };
 
-        // MEMORY-FIRST READING: Check if we have this piece in our local cache
-        if piece >= 0 {
+        // MEMORY-FIRST READING: Check if we have this piece in our local cache.
+        // Skip this check for hash probes (is_probe=true): probe reads jump to
+        // non-sequential offsets (byte 0 and file_size-65536), so the per-stream
+        // L0 slot (which holds the *last* piece read sequentially) is unlikely
+        // to match. Go directly to the shared hybrid cache tiers instead.
+        if piece >= 0 && !self.is_probe {
             // Check if we already have the right piece cached locally
             let have_cached = match &self.cached_piece_data {
                 Some((cached_piece, _)) => *cached_piece == piece,
@@ -235,9 +268,11 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                         if !self.first_read_logged {
                             self.first_read_logged = true;
                             tracing::info!(
-                                "startup: first direct-stream bytes ready after {:?} (piece={}, source=local-cache)",
+                                "startup: first direct-stream bytes ready after {:?} \
+                                 (piece={}, source=local-cache, prio={})",
                                 self.created_at.elapsed(),
-                                piece
+                                piece,
+                                self.request_priority,
                             );
                         }
 
@@ -254,11 +289,15 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                     return std::task::Poll::Ready(Ok(()));
                 }
             }
+        }
 
-            // Try to get from the hybrid cache (hot tier then warm tier).
-            // Both lookups are sync and do not park the tokio worker thread.
-            // PLAN-002 Fix 1: previously used `futures::executor::block_on` which
-            // parked the worker thread; now fully sync via moka's sync Cache.
+        // Try to get from the hybrid cache (hot tier then warm tier).
+        // This path is taken by ALL streams (including probes) — it's the shared
+        // tier and has no sequential-optimization assumptions.
+        // Both lookups are sync and do not park the tokio worker thread.
+        // PLAN-002 Fix 1: previously used `futures::executor::block_on` which
+        // parked the worker thread; now fully sync via moka's sync Cache.
+        if piece >= 0 {
             if let Some(piece_data) = self.piece_cache.get_sync(&self.info_hash, piece) {
                 self.requested_piece_via_api.remove(&piece);
                 let offset_in_cached = ((self.file_offset + pos) % self.piece_length) as usize;
@@ -272,14 +311,17 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                     if !self.first_read_logged {
                         self.first_read_logged = true;
                         tracing::info!(
-                            "startup: first direct-stream bytes ready after {:?} (piece={}, source=hybrid-cache)",
+                            "startup: first direct-stream bytes ready after {:?} \
+                             (piece={}, source=hybrid-cache, prio={})",
                             self.created_at.elapsed(),
-                            piece
+                            piece,
+                            self.request_priority,
                         );
                     }
 
                     tracing::debug!(
-                        "poll_read: Served {} bytes from hybrid cache (piece {}, offset_in_cached={})",
+                        "poll_read: Served {} bytes from hybrid cache \
+                         (piece {}, offset_in_cached={})",
                         to_read,
                         piece,
                         offset_in_cached
@@ -287,10 +329,16 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 }
 
                 // Store in L0 cache for sequential reads within the same piece.
+                // Probes also populate the L0 cache so that a second read to the
+                // same piece (e.g. the tail-block re-read during hash computation)
+                // doesn't re-enter the hybrid cache.  The L0 cache is cleared by
+                // start_seek() on each new request anyway.
                 self.cached_piece_data = Some((piece, piece_data));
 
                 // === READ-AHEAD PREFETCH ===
-                if piece != self.last_prefetch_piece {
+                // Skip read-ahead for probes: they don't read sequentially, so
+                // prefetching the next pieces wastes bandwidth and hybrid cache space.
+                if !self.is_probe && piece != self.last_prefetch_piece {
                     self.last_prefetch_piece = piece;
                     let prefetch_cache = self.piece_cache.clone();
                     let prefetch_info_hash = self.info_hash.clone();
@@ -363,9 +411,19 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             // per-stream (`wait_deadline_ms`) so concurrent initial-playback
             // and container-metadata streams don't all collapse to deadline=0
             // and force libtorrent into sequential picking by piece index.
-            let wait_deadline = self.wait_deadline_ms;
-            self.handle.set_piece_priority(piece, 7);
-            self.handle.set_piece_deadline(piece, wait_deadline);
+            //
+            // Hash probes (is_probe=true) must NOT compete with real streams:
+            // use piece priority 1 (lowest non-skip) and a very long deadline
+            // (5000ms) so real playback streams always win piece-picker ordering.
+            if self.is_probe {
+                // Low-priority re-assertion — yield to all real streams
+                self.handle.set_piece_priority(piece, 1);
+                self.handle.set_piece_deadline(piece, 5000);
+            } else {
+                let wait_deadline = self.wait_deadline_ms;
+                self.handle.set_piece_priority(piece, 7);
+                self.handle.set_piece_deadline(piece, wait_deadline);
+            }
 
             let waker = cx.waker().clone();
             tokio::spawn(async move {
@@ -395,7 +453,9 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 if !self.first_wait_logged {
                     self.first_wait_logged = true;
                     tracing::info!(
-                        "poll_read: FIRST WAIT for piece {} ({:?}, pos={}, peers={}, speed={:.1}MB/s, paused={}, wait_deadline={}ms, next_have={:?})",
+                        "poll_read: FIRST WAIT for piece {} \
+                         ({:?}, pos={}, peers={}, speed={:.1}MB/s, paused={}, \
+                         wait_deadline={}ms, prio={}, next_have={:?})",
                         piece,
                         self.seek_type,
                         pos,
@@ -403,11 +463,14 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                         status.download_rate as f64 / 1_000_000.0,
                         status.is_paused,
                         self.wait_deadline_ms,
+                        self.request_priority,
                         next_have,
                     );
                 } else {
                     tracing::info!(
-                        "poll_read: STILL WAITING for piece {} ({:?}, elapsed={:.1}s, pos={}, peers={}, speed={:.1}MB/s, paused={}, hole={}, next_have={:?})",
+                        "poll_read: STILL WAITING for piece {} \
+                         ({:?}, elapsed={:.1}s, pos={}, peers={}, speed={:.1}MB/s, \
+                         paused={}, hole={}, prio={}, next_have={:?})",
                         piece,
                         self.seek_type,
                         self.created_at.elapsed().as_secs_f64(),
@@ -416,6 +479,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                         status.download_rate as f64 / 1_000_000.0,
                         status.is_paused,
                         is_hole,
+                        self.request_priority,
                         next_have,
                     );
                 }
@@ -429,19 +493,27 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             // already handles slow-peer re-requests via request_timeout (configured
             // at session creation), so the only safe nudge is to keep asserting the
             // highest priority so the piece never drifts to a lower urgency bucket.
-            let elapsed_secs = self.created_at.elapsed().as_secs();
-            let needs_nudge = elapsed_secs >= 10
-                && self.last_deadline_reset_at
-                    .map_or(true, |t| now.duration_since(t).as_secs() >= 10);
-            if needs_nudge {
-                self.handle.set_piece_priority(piece, 7);
-                self.handle.set_piece_deadline(piece, 0);
-                self.last_deadline_reset_at = Some(now);
-                tracing::info!(
-                    "poll_read: NUDGE re-asserted priority/deadline for stuck piece {} (elapsed={:.1}s)",
-                    piece,
-                    elapsed_secs as f64,
-                );
+            //
+            // Probes skip the nudge entirely: they never need to win urgency races
+            // against real streams, and re-asserting priority/deadline on a probe
+            // piece would compete with streaming even after 10s.
+            if !self.is_probe {
+                let elapsed_secs = self.created_at.elapsed().as_secs();
+                let needs_nudge = elapsed_secs >= 10
+                    && self.last_deadline_reset_at
+                        .map_or(true, |t| now.duration_since(t).as_secs() >= 10);
+                if needs_nudge {
+                    self.handle.set_piece_priority(piece, 7);
+                    self.handle.set_piece_deadline(piece, 0);
+                    self.last_deadline_reset_at = Some(now);
+                    tracing::info!(
+                        "poll_read: NUDGE re-asserted priority/deadline for stuck piece {} \
+                         (elapsed={:.1}s, prio={})",
+                        piece,
+                        elapsed_secs as f64,
+                        self.request_priority,
+                    );
+                }
             }
 
             return std::task::Poll::Pending;
@@ -483,9 +555,11 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                     if !self.first_read_logged {
                         self.first_read_logged = true;
                         tracing::info!(
-                            "startup: first direct-stream bytes ready after {:?} (piece={}, source=cpp-memory)",
+                            "startup: first direct-stream bytes ready after {:?} \
+                             (piece={}, source=cpp-memory, prio={})",
                             self.created_at.elapsed(),
-                            piece
+                            piece,
+                            self.request_priority,
                         );
                     }
                 }
@@ -517,9 +591,11 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                         if !self.first_read_logged {
                             self.first_read_logged = true;
                             tracing::info!(
-                                "startup: first direct-stream bytes ready after {:?} (piece={}, source=warm-tier)",
+                                "startup: first direct-stream bytes ready after {:?} \
+                                 (piece={}, source=warm-tier, prio={})",
                                 self.created_at.elapsed(),
-                                piece
+                                piece,
+                                self.request_priority,
                             );
                         }
                     }
@@ -577,10 +653,12 @@ impl tokio::io::AsyncSeek for LibtorrentFileStream {
         };
 
         tracing::debug!(
-            "start_seek: {} -> {} ({:?})",
+            "start_seek: {} -> {} ({:?}, prio={}{})",
             self.current_pos,
             new_pos,
-            self.seek_type
+            self.seek_type,
+            self.request_priority,
+            if self.is_probe { " [probe]" } else { "" },
         );
 
         // Memory-only mode: just update position, no file handle to seek
