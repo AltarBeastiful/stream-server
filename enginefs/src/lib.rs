@@ -3,7 +3,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::debug;
 
@@ -32,7 +33,12 @@ use crate::backend::libtorrent::LibtorrentBackend;
 
 use crate::backend::{TorrentBackend, TorrentHandle, TorrentSource};
 
-const ENGINE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+/// Fallback timeout for engines that never had any active streams.
+/// These are torrents that were added (e.g. for metadata inspection) but
+/// whose player never actually connected to `/stream`.  They are removed
+/// after 5 minutes of `last_accessed` age, consistent with the original
+/// behaviour.
+const IDLE_ENGINE_TIMEOUT_SECS: u64 = 300;
 
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 
@@ -68,6 +74,12 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     active_file: Arc<RwLock<Option<(String, usize)>>>,
     /// Optional disk cache for persisting completed files
     disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
+    /// Seconds of stream inactivity before piece downloading is paused (peers kept).
+    /// Readable/writable after construction so `new_with_storage` can apply the
+    /// value from `BackendConfig` before the background task first fires.
+    pub grace_pause_secs: Arc<std::sync::atomic::AtomicU64>,
+    /// Seconds of stream inactivity before the torrent is fully removed from the session.
+    pub grace_remove_secs: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
@@ -109,6 +121,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             None => Arc::new(crate::trackers::TrackerManager::new()),
         };
 
+        let grace_pause_secs = Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::backend::BackendConfig::default_pause_secs(),
+        ));
+        let grace_remove_secs = Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::backend::BackendConfig::default_remove_secs(),
+        ));
+
         let efs = Self {
             backend: Arc::new(backend),
             engines: engines.clone(),
@@ -119,27 +138,108 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             active_file_streams: Arc::new(RwLock::new(HashMap::new())),
             active_file: Arc::new(RwLock::new(None)),
             disk_cache: None,
+            grace_pause_secs: grace_pause_secs.clone(),
+            grace_remove_secs: grace_remove_secs.clone(),
         };
 
         let engines_clone = engines.clone();
         let backend_clone = efs.backend.clone();
+        // Grace-period teardown task — polls every 5 s.
+        //
+        // State machine per engine (driven by `engine.inactive_since`):
+        //   inactive_since == 0   → engine was never streamed; use `last_accessed`
+        //                           age against IDLE_ENGINE_TIMEOUT_SECS for removal
+        //   inactive_since == -1  → at least one stream is currently active; skip
+        //   inactive_since > 0    → timestamp (elapsed_secs()) when the last stream
+        //                           closed; drive the pause/remove thresholds
+        //
+        // 0 – pause_secs  : do nothing (player reconnect window)
+        // pause_secs      : call pause_downloads() to stop bandwidth, keep peers
+        // remove_secs     : remove from libtorrent session (peers disconnected)
         tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            // Set of info_hashes for which pause_downloads() has already been called
+            // this inactivity window.  Cleared when a new stream starts.
+            let mut download_paused: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                let mut to_remove = Vec::new();
+                interval.tick().await;
+                let pause_secs = grace_pause_secs.load(Ordering::Relaxed);
+                let remove_secs = grace_remove_secs.load(Ordering::Relaxed);
                 let now = elapsed_secs();
+
+                // Collect actions under a short-lived read lock.
+                let mut to_pause: Vec<(String, Arc<Engine<B::Handle>>)> = Vec::new();
+                let mut to_remove: Vec<String> = Vec::new();
 
                 {
                     let read = engines_clone.read().await;
                     for (hash, engine) in read.iter() {
-                        let active = engine
-                            .active_streams
-                            .load(std::sync::atomic::Ordering::SeqCst);
-                        let last = engine
-                            .last_accessed
-                            .load(std::sync::atomic::Ordering::SeqCst);
-                        if (now - last) as u64 > ENGINE_TIMEOUT.as_secs() && active == 0 {
+                        let active = engine.active_streams.load(Ordering::SeqCst);
+                        let inactive_since = engine.inactive_since.load(Ordering::SeqCst);
+
+                        // A newly-reconnected stream clears the paused flag so that
+                        // the next inactivity window will call pause_downloads() again.
+                        if active > 0 {
+                            download_paused.remove(hash);
+                            continue;
+                        }
+
+                        // Compute seconds since the last stream ended.
+                        let secs_inactive: u64 = match inactive_since {
+                            // Engine was never streamed — use last_accessed age.
+                            // These torrents are removed at the original 300-second
+                            // timeout rather than the grace-period remove threshold.
+                            0 => {
+                                let last =
+                                    engine.last_accessed.load(Ordering::SeqCst);
+                                let secs = (now - last).max(0) as u64;
+                                if secs >= IDLE_ENGINE_TIMEOUT_SECS {
+                                    to_remove.push(hash.clone());
+                                    download_paused.remove(hash);
+                                }
+                                continue;
+                            }
+                            // A stream is active right now (race: active was 0 but
+                            // inactive_since is -1 due to load ordering).  Skip.
+                            i if i < 0 => continue,
+                            // Normal case: timestamp of last stream close.
+                            ts => (now - ts).max(0) as u64,
+                        };
+
+                        if secs_inactive >= remove_secs {
+                            // Full removal regardless of whether we already paused.
                             to_remove.push(hash.clone());
+                            download_paused.remove(hash);
+                        } else if inactive_since != 0
+                            && secs_inactive >= pause_secs
+                            && !download_paused.contains(hash)
+                        {
+                            // Only pause engines that have actually had streams
+                            // (inactive_since != 0).  Never-streamed engines are just
+                            // waiting to be removed — no piece deadlines to clear.
+                            to_pause.push((hash.clone(), engine.clone()));
+                        }
+                    }
+                }
+
+                // Call pause_downloads() outside the read lock (it's async).
+                for (hash, engine) in to_pause {
+                    match engine.handle.pause_downloads().await {
+                        Ok(()) => {
+                            tracing::info!(
+                                info_hash = %hash,
+                                "grace-period: paused downloading \
+                                 (peers kept, waiting for reconnect)"
+                            );
+                            download_paused.insert(hash);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                info_hash = %hash,
+                                "grace-period: pause_downloads failed: {}",
+                                e
+                            );
                         }
                     }
                 }
@@ -147,17 +247,23 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 if !to_remove.is_empty() {
                     let mut write = engines_clone.write().await;
                     for hash in &to_remove {
-                        debug!(info_hash = %hash, "Auto-removing inactive engine");
+                        debug!(info_hash = %hash, "grace-period: removing inactive engine");
                         write.remove(hash);
                     }
                     drop(write);
 
-                    // Actually stop the torrents in the backend session
                     for hash in to_remove {
                         if let Err(e) = backend_clone.remove_torrent(&hash).await {
-                            tracing::warn!(info_hash = %hash, "Failed to remove torrent from backend: {}", e);
+                            tracing::warn!(
+                                info_hash = %hash,
+                                "grace-period: failed to remove torrent from backend: {}",
+                                e
+                            );
                         } else {
-                            tracing::info!(info_hash = %hash, "Removed torrent from backend");
+                            tracing::info!(
+                                info_hash = %hash,
+                                "grace-period: removed torrent from backend session"
+                            );
                         }
                     }
                 }
@@ -332,12 +438,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     fn schedule_file_cleanup(&self, info_hash: String, file_idx: usize) {
-        let engines = self.engines.clone();
         let active_file = self.active_file.clone();
         let active_file_streams = self.active_file_streams.clone();
 
+        // Wait a short grace window before clearing the active_file state.  If the
+        // player reconnects within this window (typical seek / stall recovery), the
+        // guard in `on_stream_start` will cancel this task by finding `still_active`.
+        //
+        // NOTE: Piece priority cleanup (formerly done here) is now handled by the
+        // 30-second grace-period task in `new_with_backend_and_storage`, which calls
+        // `pause_downloads()`.  This avoids punishing players that reconnect between
+        // 5 s and 30 s (common for seeks in mid-torrent files).
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
             let key = (info_hash.clone(), file_idx);
             let still_active = {
@@ -353,38 +466,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 return;
             }
 
+            // Clear the active_file slot so that the next on_stream_start call can
+            // set it (and call clear_file_priorities for file switching if needed).
             {
                 let mut active = active_file.write().await;
                 if let Some((ref h, idx)) = *active {
                     if h == &info_hash && idx == file_idx {
                         tracing::info!(
-                            "Delayed cleanup: clearing active file for {} file_idx={}",
+                            "Delayed cleanup: clearing active file for {} file_idx={} \
+                             (piece priorities deferred to 30-second grace period)",
                             info_hash,
                             file_idx
                         );
                         *active = None;
                     }
-                }
-            }
-
-            let engine = {
-                let engines = engines.read().await;
-                engines.get(&info_hash).cloned()
-            };
-            if let Some(engine) = engine {
-                if let Err(e) = engine.handle.clear_file_streaming(file_idx).await {
-                    tracing::warn!(
-                        "Failed to clear file priorities for {} idx={}: {}",
-                        info_hash,
-                        file_idx,
-                        e
-                    );
-                } else {
-                    tracing::info!(
-                        "Delayed cleanup: cleared file priorities for {} idx={}",
-                        info_hash,
-                        file_idx
-                    );
                 }
             }
         });
@@ -444,6 +539,9 @@ impl BackendEngineFS<LibtorrentBackend> {
     ) -> Result<Self> {
         let download_dir = root_dir.join("libtorrent-downloads");
         let cache_size = config.cache.size;
+        // Extract grace-period values before config is consumed by the backend.
+        let pause_secs = config.stream_inactivity_pause_secs;
+        let remove_secs = config.stream_inactivity_remove_secs;
         let backend = LibtorrentBackend::new(download_dir.clone(), config)?;
 
         let mut efs = Self::new_with_backend_and_storage(
@@ -453,6 +551,12 @@ impl BackendEngineFS<LibtorrentBackend> {
             download_dir,
             tracker_storage,
         );
+
+        // Apply grace-period config from BackendConfig.  The background task
+        // initialises these to their defaults (30 s / 60 s); overwrite here with
+        // the user-supplied values so subsequent ticks use the correct thresholds.
+        efs.grace_pause_secs.store(pause_secs, Ordering::Relaxed);
+        efs.grace_remove_secs.store(remove_secs, Ordering::Relaxed);
 
         // Set up disk cache for conditional file persistence
         let disk_cache_dir = root_dir.join("disk-cache");

@@ -256,7 +256,9 @@ pub async fn hwaccel_profiler() -> impl IntoResponse {
 
 pub async fn probe_hwaccel() -> Vec<String> {
     let mut profiles = Vec::new();
-    let output = match tokio::process::Command::new("ffmpeg")
+
+    // First check which encoders are compiled into ffmpeg.
+    let encoder_list = match tokio::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-encoders"])
         .output()
         .await
@@ -265,31 +267,61 @@ pub async fn probe_hwaccel() -> Vec<String> {
         Err(_) => return profiles,
     };
 
-    if output.contains("h264_nvenc") {
+    // For each candidate, do a short null-output encode to verify the hardware
+    // is actually accessible. Just checking the encoder list is not enough —
+    // e.g. h264_nvenc is listed even when no NVIDIA GPU is present.
+    async fn test_encoder(encoder: &str, extra_args: &[&str]) -> bool {
+        // Generate a tiny synthetic video frame and try to encode one packet.
+        let mut args = vec![
+            "-hide_banner",
+            "-loglevel", "error",
+            "-f", "lavfi",
+            "-i", "nullsrc=s=64x64:r=1",
+            "-vframes", "1",
+        ];
+        args.extend_from_slice(extra_args);
+        args.extend_from_slice(&["-c:v", encoder, "-f", "null", "-"]);
+
+        tokio::process::Command::new("ffmpeg")
+            .args(&args)
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    if encoder_list.contains("h264_nvenc")
+        && test_encoder("h264_nvenc", &["-hwaccel", "cuda"]).await
+    {
         profiles.push("nvenc".to_string());
     }
-    if output.contains("h264_vaapi") {
+    if encoder_list.contains("h264_vaapi")
+        && test_encoder("h264_vaapi", &["-hwaccel", "vaapi", "-vaapi_device", "/dev/dri/renderD128"]).await
+    {
         profiles.push("vaapi".to_string());
     }
-    if output.contains("h264_vdpau") {
-        profiles.push("vdpau".to_string());
-    }
-    if output.contains("h264_qsv") {
+    if encoder_list.contains("h264_qsv")
+        && test_encoder("h264_qsv", &["-hwaccel", "qsv"]).await
+    {
         profiles.push("qsv".to_string());
     }
-    if output.contains("h264_omx") {
-        profiles.push("omx".to_string());
-    }
-    if output.contains("h264_v4l2m2m") {
+    if encoder_list.contains("h264_v4l2m2m")
+        && test_encoder("h264_v4l2m2m", &[]).await
+    {
         profiles.push("v4l2m2m".to_string());
     }
-    if output.contains("h264_videotoolbox") {
+    if encoder_list.contains("h264_videotoolbox")
+        && test_encoder("h264_videotoolbox", &["-hwaccel", "videotoolbox"]).await
+    {
         profiles.push("videotoolbox".to_string());
     }
-    if output.contains("h264_mediacodec") {
+    if encoder_list.contains("h264_mediacodec")
+        && test_encoder("h264_mediacodec", &[]).await
+    {
         profiles.push("mediacodec".to_string());
     }
 
+    tracing::info!("Available hardware encoders: {:?}", profiles);
     profiles
 }
 

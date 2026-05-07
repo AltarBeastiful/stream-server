@@ -9,10 +9,10 @@ use axum::{
 use enginefs::EngineFS; // This is a type alias in enginefs::lib.rs based on features
 use fslock::LockFile;
 use state::AppState;
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, services::{ServeDir, ServeFile}, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[global_allocator]
@@ -199,8 +199,15 @@ async fn run_server(
         }
     }
 
+    // When WEB_PATH is set, serve the local web build as a SPA over HTTP.
+    // This avoids the mixed-content block that happens when the external
+    // web.stremio.com (HTTPS) tries to reach the local server (HTTP).
+    let web_path = std::env::var("WEB_PATH").ok().map(PathBuf::from);
+    if let Some(ref p) = web_path {
+        tracing::info!("Serving local web build from {:?}", p);
+    }
+
     let app = Router::new()
-        .route("/", get(root_redirect))
         .route("/heartbeat", get(routes::system::heartbeat))
         .route("/stats.json", get(routes::system::get_stats))
         .route("/network-info", get(routes::system::network_info))
@@ -221,11 +228,17 @@ async fn run_server(
             "/{infoHash}/stats.json",
             get(routes::system::get_engine_stats),
         )
-        .route(
-            "/{infoHash}/{idx}/stats.json",
+        .route("/{infoHash}/{idx}/stats.json",
             get(routes::system::get_file_stats),
         )
         .route("/{infoHash}/peers", get(routes::peers::get_peers))
+        // Preload routes — must come before the generic stream route
+        .route(
+            "/{infoHash}/{fileIdx}/preload",
+            post(routes::preload::start_preload)
+                .get(routes::preload::preload_progress)
+                .delete(routes::preload::cancel_preload),
+        )
         // Stream routes - both patterns for compatibility
         .route(
             "/stream/{infoHash}/{fileIdx}",
@@ -295,6 +308,14 @@ async fn run_server(
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state);
+
+    // Attach SPA fallback or external redirect depending on WEB_PATH
+    let app = if let Some(ref p) = web_path {
+        let index = p.join("index.html");
+        app.fallback_service(ServeDir::new(p).not_found_service(ServeFile::new(index)))
+    } else {
+        app.route("/", get(root_redirect))
+    };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 11470));
     tracing::info!("listening on {}", addr);

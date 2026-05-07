@@ -42,7 +42,7 @@
 //! `HashMap<i32, usize>` so reads know exactly how many bytes to return.
 
 use bytes::Bytes;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -50,6 +50,41 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 type PieceKey = (String, i32); // (info_hash_lower, piece_index)
+
+/// Shared map of piece pin counts.  Keyed by (info_hash_lower, piece_idx).
+/// Each outstanding reader of a piece (via the direct C++ memory path) holds
+/// one count increment for the duration of its read.  The drain task checks
+/// this map before calling `memory_evict_piece_for_hash()`: if a piece is
+/// pinned it defers the C++ free until all readers have finished.
+type PinCounts = Arc<Mutex<HashMap<PieceKey, u32>>>;
+
+/// RAII guard that decrements the pin count for `key` when dropped.
+/// Returned by [`HybridPieceCache::pin_piece`].
+pub struct PiecePinGuard {
+    key: PieceKey,
+    counts: PinCounts,
+}
+
+impl Drop for PiecePinGuard {
+    fn drop(&mut self) {
+        let mut map = self.counts.lock();
+        if let Some(c) = map.get_mut(&self.key) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
+// PiecePinGuard is Send because Arc<Mutex<...>>, String, and i32 are all Send.
+
+/// A piece whose C++ eviction was deferred because a reader held a pin.
+/// Only the identity is needed — the warm-tier write has already completed.
+struct DeferredEviction {
+    info_hash: String,
+    piece_idx: i32,
+}
 
 // ============================================================================
 // Eviction message
@@ -288,6 +323,12 @@ impl Default for HybridCacheConfig {
 pub struct HybridPieceCache {
     hot: moka::sync::Cache<PieceKey, Bytes>,
     warm: Arc<WarmTier>,
+    /// Per-piece pin counts. A non-zero count means at least one reader is
+    /// currently accessing that piece's data from C++ memory storage.  The
+    /// eviction drain task checks this before calling
+    /// `memory_evict_piece_for_hash()` and defers the call until the count
+    /// reaches zero.
+    pin_counts: PinCounts,
 }
 
 impl HybridPieceCache {
@@ -304,6 +345,11 @@ impl HybridPieceCache {
         let (evict_tx, evict_rx) = std::sync::mpsc::sync_channel::<EvictedPiece>(4096);
 
         let warm_clone = warm.clone();
+
+        // Shared pin-count map: passed to both the cache (for pin_piece()) and
+        // the drain task (for checking before C++ eviction).
+        let pin_counts: PinCounts = Arc::new(Mutex::new(HashMap::new()));
+        let pin_counts_drain = pin_counts.clone();
 
         let hot = {
             let evict_tx_for_listener = evict_tx.clone();
@@ -332,41 +378,126 @@ impl HybridPieceCache {
         // Uses spawn_blocking because pwrite is synchronous OS I/O.
         // Sequential by design: only one piece is processed at a time, so C++ RAM is
         // freed only AFTER the warm-tier write is confirmed durable (within the session).
+        //
+        // Pin-count protocol:
+        //   - Readers that access C++ memory directly (not via hot/warm tier) increment
+        //     the pin count for a piece before calling memory_read_piece_for_hash() and
+        //     hold a PiecePinGuard that decrements on drop.
+        //   - This task checks the pin count before calling memory_evict_piece_for_hash().
+        //     If the piece is pinned, the C++ free is deferred into `deferred` and retried
+        //     every 50 ms until all readers have finished.
+        //   - The warm-tier write is always performed first (it reads from `evicted.data:
+        //     Bytes`, an independent Rust allocation — safe regardless of pin state).
         tokio::task::spawn_blocking(move || {
-            loop {
-                match evict_rx.recv() {
-                    Ok(evicted) => {
-                        // 1. Persist to warm tier. Returns true only if the write
-                        //    completed successfully. On failure the piece is NOT freed
-                        //    from C++ — it stays available at the cost of C++ RAM.
-                        let persisted = warm_clone.write_piece_sync(
-                            &evicted.info_hash,
-                            evicted.piece_idx,
-                            &evicted.data,
-                        );
+            // Pieces whose warm write completed but whose C++ free was deferred
+            // because a reader held a pin at eviction time.
+            let mut deferred: Vec<DeferredEviction> = Vec::new();
 
-                        // 2. Free C++ in-memory bytes — only when durably written.
-                        //    libtorrent's bitfield is unaffected; have_piece() stays true.
-                        if persisted {
-                            #[cfg(feature = "libtorrent")]
-                            {
+            loop {
+                // --- Retry deferred evictions ---
+                if !deferred.is_empty() {
+                    let mut still_pinned: Vec<DeferredEviction> = Vec::new();
+                    {
+                        let map = pin_counts_drain.lock();
+                        for ev in deferred.drain(..) {
+                            let count = map
+                                .get(&(ev.info_hash.clone(), ev.piece_idx))
+                                .copied()
+                                .unwrap_or(0);
+                            if count > 0 {
+                                still_pinned.push(ev);
+                            } else {
+                                // Reader has finished — safe to free C++ memory now.
+                                #[cfg(feature = "libtorrent")]
                                 libtorrent_sys::memory_evict_piece_for_hash(
-                                    &evicted.info_hash,
-                                    evicted.piece_idx,
+                                    &ev.info_hash,
+                                    ev.piece_idx,
                                 );
                             }
                         }
                     }
-                    Err(_) => {
-                        // Channel closed (HybridPieceCache dropped) — shut down.
-                        debug!("HybridPieceCache: eviction drain task exiting");
-                        break;
+                    if !still_pinned.is_empty() {
+                        if still_pinned.len() > 10 {
+                            warn!(
+                                "HybridPieceCache: {} pieces still pinned by readers; \
+                                 hot-tier overshoot is acceptable — C++ eviction deferred",
+                                still_pinned.len()
+                            );
+                        }
+                        deferred = still_pinned;
+                    } else {
+                        deferred = Vec::new();
+                    }
+                }
+
+                // --- Receive next evicted piece ---
+                let evicted = if deferred.is_empty() {
+                    // No deferred work: block until the next eviction.
+                    match evict_rx.recv() {
+                        Ok(e) => e,
+                        Err(_) => {
+                            debug!("HybridPieceCache: eviction drain task exiting");
+                            break;
+                        }
+                    }
+                } else {
+                    // Have deferred work: use a timeout so we retry pinned pieces promptly.
+                    match evict_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(e) => e,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            debug!("HybridPieceCache: eviction drain task exiting (with deferred)");
+                            break;
+                        }
+                    }
+                };
+
+                // 1. Persist to warm tier. Returns true only if the write
+                //    completed successfully. On failure the piece is NOT freed
+                //    from C++ — it stays available at the cost of C++ RAM.
+                let persisted = warm_clone.write_piece_sync(
+                    &evicted.info_hash,
+                    evicted.piece_idx,
+                    &evicted.data,
+                );
+
+                if persisted {
+                    // 2. Check pin count before freeing C++ in-memory bytes.
+                    //    A non-zero count means poll_read is currently inside
+                    //    memory_read_piece_for_hash() for this piece — defer
+                    //    the free until all readers finish.
+                    let is_pinned = pin_counts_drain
+                        .lock()
+                        .get(&(evicted.info_hash.clone(), evicted.piece_idx))
+                        .copied()
+                        .unwrap_or(0)
+                        > 0;
+
+                    if is_pinned {
+                        debug!(
+                            "HybridPieceCache: piece {}:{} pinned by reader — \
+                             deferring C++ eviction",
+                            evicted.info_hash, evicted.piece_idx
+                        );
+                        deferred.push(DeferredEviction {
+                            info_hash: evicted.info_hash,
+                            piece_idx: evicted.piece_idx,
+                        });
+                    } else {
+                        // 3. Free C++ in-memory bytes — only when durably written
+                        //    and no readers hold a pin.
+                        //    libtorrent's bitfield is unaffected; have_piece() stays true.
+                        #[cfg(feature = "libtorrent")]
+                        libtorrent_sys::memory_evict_piece_for_hash(
+                            &evicted.info_hash,
+                            evicted.piece_idx,
+                        );
                     }
                 }
             }
         });
 
-        Arc::new(Self { hot, warm })
+        Arc::new(Self { hot, warm, pin_counts })
     }
 
     // -------------------------------------------------------------------------
@@ -438,6 +569,36 @@ impl HybridPieceCache {
         // torrents' pieces intact.
         let _ = self.hot.invalidate_entries_if(move |k: &PieceKey, _v: &Bytes| k.0 == ih);
         self.warm.remove(info_hash);
+    }
+
+    // -------------------------------------------------------------------------
+    // Pin-count API
+    // -------------------------------------------------------------------------
+
+    /// Increment the pin count for a piece and return a RAII guard that
+    /// decrements it on drop.
+    ///
+    /// Call this **before** invoking `libtorrent_sys::memory_read_piece_for_hash()`
+    /// (the direct C++ memory read path in `poll_read`). The guard prevents the
+    /// eviction drain task from calling `memory_evict_piece_for_hash()` for the
+    /// same piece while the C++ read is in progress.
+    ///
+    /// # Concurrency
+    ///
+    /// Pin and unpin operations are serialised by `self.pin_counts` (a
+    /// `parking_lot::Mutex`). The critical section is brief (one HashMap
+    /// lookup + integer increment), so contention is negligible even under
+    /// concurrent streams.
+    pub fn pin_piece(&self, info_hash: &str, piece_idx: i32) -> PiecePinGuard {
+        let key = (info_hash.to_lowercase(), piece_idx);
+        {
+            let mut map = self.pin_counts.lock();
+            *map.entry(key.clone()).or_insert(0) += 1;
+        }
+        PiecePinGuard {
+            key,
+            counts: self.pin_counts.clone(),
+        }
     }
 
     /// Cache statistics: `(hot_entry_count, hot_weighted_size_bytes)`.

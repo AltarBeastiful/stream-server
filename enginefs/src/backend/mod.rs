@@ -58,6 +58,17 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// Clear streaming state for a file (set priority to 0, clear piece deadlines).
     /// Called when switching to a different file to ensure exclusive downloading.
     async fn clear_file_streaming(&self, file_idx: usize) -> Result<()>;
+    /// Pause all piece downloading for this torrent without disconnecting peers.
+    ///
+    /// Called by the grace-period background task after `stream_inactivity_pause_secs`
+    /// of inactivity (default 30 s) to stop consuming bandwidth while keeping peer
+    /// connections alive for a fast reconnect.  Sets all file priorities to 0 and
+    /// clears all piece deadlines.  Peer connections are preserved so that a
+    /// reconnecting player can resume at full speed without waiting for peer
+    /// re-discovery.
+    ///
+    /// This is **not** the same as `handle.pause()` (which disconnects peers).
+    async fn pause_downloads(&self) -> Result<()>;
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -187,6 +198,24 @@ pub struct BackendConfig {
     pub peer_search: PeerSearch,
     pub swarm_cap: SwarmCap,
     pub speed_profile: TorrentSpeedProfile,
+    /// Seconds of inactivity (no active streams) before downloading is paused
+    /// for a torrent.  Piece deadlines are cleared and all file priorities are
+    /// set to 0 to stop consuming bandwidth.  Peer connections are **not**
+    /// disconnected so that a reconnecting player gets full speed immediately.
+    /// Default: 30 seconds.
+    #[serde(default = "BackendConfig::default_pause_secs")]
+    pub stream_inactivity_pause_secs: u64,
+    /// Seconds of inactivity before the torrent is fully removed from the
+    /// libtorrent session (peers disconnected, C++ state freed).  The hybrid
+    /// piece cache warm tier is preserved on disk so subsequent re-opens
+    /// can resume from it.  Default: 60 seconds.
+    #[serde(default = "BackendConfig::default_remove_secs")]
+    pub stream_inactivity_remove_secs: u64,
+}
+
+impl BackendConfig {
+    pub fn default_pause_secs() -> u64 { 30 }
+    pub fn default_remove_secs() -> u64 { 60 }
 }
 
 impl Default for BackendConfig {
@@ -197,6 +226,8 @@ impl Default for BackendConfig {
             peer_search: PeerSearch::default(),
             swarm_cap: SwarmCap::default(),
             speed_profile: TorrentSpeedProfile::default(),
+            stream_inactivity_pause_secs: Self::default_pause_secs(),
+            stream_inactivity_remove_secs: Self::default_remove_secs(),
         }
     }
 }

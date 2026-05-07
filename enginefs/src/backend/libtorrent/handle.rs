@@ -773,4 +773,31 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
 
         Ok(())
     }
+
+    async fn pause_downloads(&self) -> anyhow::Result<()> {
+        let session = self.session.read().await;
+        let mut handle = session
+            .find_torrent(&self.info_hash)
+            .map_err(|e| anyhow!("Torrent not found: {}", e))?;
+
+        // Clear all piece deadlines — stops libtorrent from urgently fetching pieces.
+        // This pauses active downloading without disconnecting peers (unlike handle.pause()).
+        handle.clear_piece_deadlines();
+
+        // Set every file back to priority 0 (skip) so the piece picker doesn't
+        // schedule new requests.  The next call to get_file_reader() will restore
+        // the priority for the specific file being streamed.
+        let files = handle.files();
+        for (idx, _f) in files.iter().enumerate() {
+            handle.set_file_priority(idx as i32, 0);
+        }
+
+        tracing::info!(
+            "pause_downloads: paused downloading for {} \
+             (peers kept connected for fast reconnect)",
+            self.info_hash
+        );
+
+        Ok(())
+    }
 }

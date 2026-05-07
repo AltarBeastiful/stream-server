@@ -16,6 +16,7 @@ pub struct AppState {
     pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
     pub nzb_sessions: Arc<dashmap::DashMap<String, crate::archives::nzb::session::NzbSession>>,
     pub devices: Arc<RwLock<Vec<crate::ssdp::Device>>>,
+    pub preload_sessions: Arc<dashmap::DashMap<String, crate::routes::preload::PreloadTask>>,
 }
 
 impl AppState {
@@ -40,6 +41,7 @@ impl AppState {
             archive_cache: Arc::new(dashmap::DashMap::new()),
             nzb_sessions: Arc::new(dashmap::DashMap::new()),
             devices: Arc::new(RwLock::new(Vec::new())),
+            preload_sessions: Arc::new(dashmap::DashMap::new()),
         }
     }
 

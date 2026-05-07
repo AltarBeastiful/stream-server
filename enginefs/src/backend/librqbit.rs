@@ -292,6 +292,21 @@ impl TorrentHandle for LibrqbitHandle {
         // Return None to fall back to HTTP URL probing
         None
     }
+
+    async fn prepare_file_for_streaming(&self, _file_idx: usize) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn clear_file_streaming(&self, _file_idx: usize) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn pause_downloads(&self) -> anyhow::Result<()> {
+        // librqbit backend does not support per-torrent download pausing at
+        // the piece-priority level.  Return Ok so the grace-period task can
+        // continue without crashing.
+        Ok(())
+    }
 }
 
 impl Clone for LibrqbitHandle {

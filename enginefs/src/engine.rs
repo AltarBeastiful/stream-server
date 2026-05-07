@@ -25,6 +25,16 @@ pub struct Engine<H: TorrentHandle> {
     pub active_streams: Arc<AtomicUsize>,
     pub probe_cache: Mutex<HashMap<usize, crate::hls::ProbeResult>>,
     pub data_cache: DataCache,
+    /// Unix timestamp (via `elapsed_secs()`) recorded when the last active stream
+    /// for this torrent closes.  Special values:
+    ///   `0`  — no stream has ever started on this engine (initial state).
+    ///   `-1` — at least one stream is currently active (reset in `get_file()`).
+    ///   `>0` — timestamp of the moment `active_streams` last reached zero.
+    ///
+    /// The grace-period background task in `BackendEngineFS` reads this to decide
+    /// when to pause downloading (download-pause window) and when to fully remove
+    /// the torrent (remove window).
+    pub inactive_since: AtomicI64,
 }
 
 impl<H: TorrentHandle> Engine<H> {
@@ -41,6 +51,8 @@ impl<H: TorrentHandle> Engine<H> {
                 .weigher(|_key, value: &Arc<Vec<u8>>| value.len() as u32)
                 .max_capacity(64 * 1024 * 1024) // 64MB cache per engine
                 .build(),
+            // 0 = no stream has ever started yet.
+            inactive_since: AtomicI64::new(0),
         }
     }
 
@@ -219,6 +231,11 @@ impl<H: TorrentHandle> Engine<H> {
 
         self.last_accessed
             .store(elapsed_secs(), Ordering::SeqCst);
+
+        // Signal that at least one stream is active.  The grace-period task reads
+        // this to cancel a pending download-pause or teardown countdown.
+        // Use `-1` as the sentinel for "currently streaming".
+        self.inactive_since.store(-1, Ordering::SeqCst);
 
         let files = self.handle.get_files().await;
         if file_idx >= files.len() {

@@ -324,6 +324,9 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                             if !prefetch_handle.have_piece(next_piece) {
                                 continue;
                             }
+                            // Pin the piece before reading from C++ memory so the
+                            // eviction drain task cannot free C++ RAM concurrently.
+                            let _pin = prefetch_cache.pin_piece(&prefetch_info_hash, next_piece);
                             // Read directly from C++ memory storage.
                             let data = libtorrent_sys::memory_read_piece_for_hash(
                                 &prefetch_info_hash,
@@ -340,6 +343,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                                     next_piece
                                 );
                             }
+                            // _pin drops here, decrementing the pin count.
                         }
                     });
                 }
@@ -448,6 +452,13 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
         //   (a) The alert pump hasn't processed piece_finished_alert yet (race window), OR
         //   (b) The piece was evicted from C++ (returns empty) but is in the warm tier.
         if piece >= 0 && !self.requested_piece_via_api.contains_key(&piece) {
+            // Pin the piece BEFORE reading from C++ memory.  The pin guard prevents
+            // the eviction drain task from calling memory_evict_piece_for_hash() for
+            // this piece while our read is in progress.  The guard is dropped at the
+            // end of this block (whether the read succeeds, finds empty data, or falls
+            // back to the warm tier).
+            let _pin_guard = self.piece_cache.pin_piece(&self.info_hash, piece);
+
             let piece_data = libtorrent_sys::memory_read_piece_for_hash(&self.info_hash, piece);
             if !piece_data.is_empty() {
                 tracing::debug!(

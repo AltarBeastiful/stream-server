@@ -40,7 +40,25 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
 
 impl<H: TorrentHandle> Drop for FileHandle<H> {
     fn drop(&mut self) {
-        self.engine.active_streams.fetch_sub(1, Ordering::SeqCst);
+        // Decrement active_streams and capture the value that was there before the decrement.
+        let prev = self.engine.active_streams.fetch_sub(1, Ordering::SeqCst);
+
+        // If prev == 1 we just decremented to 0: this was the last active stream.
+        // Record the timestamp so the grace-period background task knows when
+        // inactivity began for this torrent.
+        if prev == 1 {
+            let ts = crate::elapsed_secs();
+            // Only update if the engine hasn't already been re-activated (sentinel = -1).
+            // Use a compare-exchange: if inactive_since is currently -1 (active) or 0
+            // (never had streams), set it to the current timestamp.
+            // SeqCst: we need this store to be visible to the grace-period task promptly.
+            self.engine.inactive_since.store(ts, Ordering::SeqCst);
+            tracing::debug!(
+                "FileHandle::drop: last stream closed for {} — inactive_since={}",
+                self.engine.info_hash,
+                ts
+            );
+        }
     }
 }
 
