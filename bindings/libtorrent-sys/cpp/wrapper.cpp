@@ -682,10 +682,12 @@ rust::String handle_get_info_hash_v2(TorrentHandle const &handle) {
 }
 
 rust::String handle_get_name(TorrentHandle const &handle) {
+  if (!handle.handle.is_valid()) return rust::String("");
   return rust::String(handle.handle.status().name);
 }
 
 TorrentStatus handle_get_status(TorrentHandle const &handle) {
+  if (!handle.handle.is_valid()) return TorrentStatus{};
   return make_torrent_status(handle.handle.status());
 }
 
@@ -693,35 +695,48 @@ TorrentStatus handle_get_status(TorrentHandle const &handle) {
 // TORRENT HANDLE - CONTROL
 // ============================================================================
 
-void handle_pause(TorrentHandle &handle) { handle.handle.pause(); }
+void handle_pause(TorrentHandle &handle) {
+  if (!handle.handle.is_valid()) return;
+  handle.handle.pause();
+}
 
-void handle_resume(TorrentHandle &handle) { handle.handle.resume(); }
+void handle_resume(TorrentHandle &handle) {
+  if (!handle.handle.is_valid()) return;
+  handle.handle.resume();
+}
 
 void handle_set_upload_limit(TorrentHandle &handle, int32_t limit) {
+  if (!handle.handle.is_valid()) return;
   handle.handle.set_upload_limit(limit);
 }
 
 void handle_set_download_limit(TorrentHandle &handle, int32_t limit) {
+  if (!handle.handle.is_valid()) return;
   handle.handle.set_download_limit(limit);
 }
 
 int32_t handle_get_upload_limit(TorrentHandle const &handle) {
+  if (!handle.handle.is_valid()) return 0;
   return handle.handle.upload_limit();
 }
 
 int32_t handle_get_download_limit(TorrentHandle const &handle) {
+  if (!handle.handle.is_valid()) return 0;
   return handle.handle.download_limit();
 }
 
 void handle_force_recheck(TorrentHandle &handle) {
+  if (!handle.handle.is_valid()) return;
   handle.handle.force_recheck();
 }
 
 void handle_force_reannounce(TorrentHandle &handle) {
+  if (!handle.handle.is_valid()) return;
   handle.handle.force_reannounce();
 }
 
 void handle_force_dht_announce(TorrentHandle &handle) {
+  if (!handle.handle.is_valid()) return;
   handle.handle.force_dht_announce();
 }
 
@@ -730,6 +745,7 @@ void handle_force_dht_announce(TorrentHandle &handle) {
 // ============================================================================
 
 void handle_set_sequential_download(TorrentHandle &handle, bool enable) {
+  if (!handle.handle.is_valid()) return;
   if (enable)
     handle.handle.set_flags(lt::torrent_flags::sequential_download);
   else
@@ -737,19 +753,23 @@ void handle_set_sequential_download(TorrentHandle &handle, bool enable) {
 }
 
 bool handle_is_sequential_download(TorrentHandle const &handle) {
+  if (!handle.handle.is_valid()) return false;
   return bool(handle.handle.flags() & lt::torrent_flags::sequential_download);
 }
 
 void handle_set_piece_deadline(TorrentHandle &handle, int32_t piece,
                                int32_t deadline_ms) {
+  if (!handle.handle.is_valid()) return;
   handle.handle.set_piece_deadline(lt::piece_index_t(piece), deadline_ms);
 }
 
 void handle_reset_piece_deadline(TorrentHandle &handle, int32_t piece) {
+  if (!handle.handle.is_valid()) return;
   handle.handle.reset_piece_deadline(lt::piece_index_t(piece));
 }
 
 void handle_clear_piece_deadlines(TorrentHandle &handle) {
+  if (!handle.handle.is_valid()) return;
   handle.handle.clear_piece_deadlines();
 }
 
@@ -759,6 +779,8 @@ void handle_clear_piece_deadlines(TorrentHandle &handle) {
 
 rust::Vec<FileInfo> handle_get_files(TorrentHandle const &handle) {
   rust::Vec<FileInfo> result;
+
+  if (!handle.handle.is_valid()) return result;
 
   auto ti = handle.handle.torrent_file();
   if (!ti)
@@ -804,6 +826,7 @@ rust::Vec<FileInfo> handle_get_files(TorrentHandle const &handle) {
 
 rust::Vec<int32_t> handle_get_file_priorities(TorrentHandle const &handle) {
   rust::Vec<int32_t> result;
+  if (!handle.handle.is_valid()) return result;
   for (auto p : handle.handle.get_file_priorities())
     result.push_back(static_cast<int32_t>(static_cast<uint8_t>(p)));
   return result;
@@ -811,6 +834,7 @@ rust::Vec<int32_t> handle_get_file_priorities(TorrentHandle const &handle) {
 
 void handle_set_file_priority(TorrentHandle &handle, int32_t index,
                               int32_t priority) {
+  if (!handle.handle.is_valid()) return;
   handle.handle.file_priority(
       lt::file_index_t(index),
       lt::download_priority_t(static_cast<uint8_t>(priority)));
@@ -818,6 +842,7 @@ void handle_set_file_priority(TorrentHandle &handle, int32_t index,
 
 void handle_set_file_priorities(TorrentHandle &handle,
                                 rust::Slice<const int32_t> priorities) {
+  if (!handle.handle.is_valid()) return;
   std::vector<lt::download_priority_t> prios;
   for (int32_t p : priorities)
     prios.push_back(lt::download_priority_t(static_cast<uint8_t>(p)));
@@ -848,11 +873,13 @@ int32_t handle_piece_length(TorrentHandle const &handle) {
 }
 
 bool handle_have_piece(TorrentHandle const &handle, int32_t piece) {
+  if (!handle.handle.is_valid()) return false;
   return handle.handle.have_piece(lt::piece_index_t(piece));
 }
 
 rust::Vec<int32_t> handle_get_piece_availability(TorrentHandle const &handle) {
   rust::Vec<int32_t> result;
+  if (!handle.handle.is_valid()) return result;
   std::vector<int> avail;
   handle.handle.piece_availability(avail);
   for (int a : avail)
@@ -862,6 +889,7 @@ rust::Vec<int32_t> handle_get_piece_availability(TorrentHandle const &handle) {
 
 void handle_set_piece_priority(TorrentHandle &handle, int32_t piece,
                                int32_t priority) {
+  if (!handle.handle.is_valid()) return;
   handle.handle.piece_priority(
       lt::piece_index_t(piece),
       lt::download_priority_t(static_cast<uint8_t>(priority)));
@@ -869,12 +897,14 @@ void handle_set_piece_priority(TorrentHandle &handle, int32_t piece,
 
 rust::Vec<int32_t> handle_get_piece_priorities(TorrentHandle const &handle) {
   rust::Vec<int32_t> result;
+  if (!handle.handle.is_valid()) return result;
   for (auto p : handle.handle.get_piece_priorities())
     result.push_back(static_cast<int32_t>(static_cast<uint8_t>(p)));
   return result;
 }
 
 void handle_read_piece(TorrentHandle &handle, int32_t piece) {
+  if (!handle.handle.is_valid()) return;
   handle.handle.read_piece(lt::piece_index_t(piece));
 }
 
@@ -884,6 +914,7 @@ void handle_read_piece(TorrentHandle &handle, int32_t piece) {
 
 rust::Vec<PeerInfo> handle_get_peers(TorrentHandle const &handle) {
   rust::Vec<PeerInfo> result;
+  if (!handle.handle.is_valid()) return result;
   std::vector<lt::peer_info> peers;
   handle.handle.get_peer_info(peers);
 
