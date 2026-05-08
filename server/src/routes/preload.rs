@@ -8,7 +8,6 @@ use axum::{
 use enginefs::backend::TorrentHandle;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -22,6 +21,14 @@ pub enum PreloadProgress {
     Downloading { progress: f64, speed: f64 },
     Ready,
     Failed { reason: String },
+}
+
+/// Query parameters accepted by `DELETE /{infoHash}/{fileIdx}/preload`.
+#[derive(Deserialize, Default)]
+pub struct CancelQuery {
+    /// When `true`, also delete all downloaded data from disk.
+    #[serde(default)]
+    delete: bool,
 }
 
 /// Live state for a single preload operation.
@@ -253,11 +260,11 @@ pub async fn preload_progress(
 
 pub async fn cancel_preload(
     Path((info_hash, _file_idx)): Path<(String, usize)>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<CancelQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let info_hash = info_hash.to_lowercase();
-    let hard_delete = params.get("delete").map(|v| v == "true").unwrap_or(false);
+    let hard_delete = params.delete;
 
     if let Some((_, task)) = state.preload_sessions.remove(&info_hash) {
         task.abort_handle.abort();
