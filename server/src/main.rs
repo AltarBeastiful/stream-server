@@ -236,6 +236,10 @@ async fn run_server(
         .route("/{infoHash}/peers", get(routes::peers::get_peers))
         // Preload routes — must come before the generic stream route
         .route(
+            "/preload/disk-space",
+            get(routes::preload::disk_space),
+        )
+        .route(
             "/{infoHash}/{fileIdx}/preload",
             post(routes::preload::start_preload)
                 .get(routes::preload::preload_progress)

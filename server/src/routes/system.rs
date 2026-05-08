@@ -296,7 +296,7 @@ pub async fn probe_hwaccel() -> Vec<String> {
         profiles.push("nvenc".to_string());
     }
     if encoder_list.contains("h264_vaapi")
-        && test_encoder("h264_vaapi", &["-hwaccel", "vaapi", "-vaapi_device", "/dev/dri/renderD128"]).await
+        && test_encoder("h264_vaapi", &["-hwaccel", "vaapi", "-vaapi_device", "/dev/dri/renderD128",  "-vf", "format=nv12,hwupload"]).await
     {
         profiles.push("vaapi".to_string());
     }

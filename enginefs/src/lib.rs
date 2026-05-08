@@ -328,6 +328,34 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engines.remove(&info_hash.to_lowercase());
     }
 
+    /// Remove a torrent from the session **and** delete its downloaded files from disk.
+    ///
+    /// Called by the preload `DELETE ?delete=true` route.  Removes the engine from the
+    /// in-memory map, then instructs the backend to delete the on-disk data.  Errors
+    /// from the backend are surfaced to the caller so they can be returned as HTTP 500.
+    pub async fn remove_engine_and_files(&self, info_hash: &str) -> Result<()> {
+        let info_hash = info_hash.to_lowercase();
+        {
+            let mut engines = self.engines.write().await;
+            engines.remove(&info_hash);
+        }
+        // Best-effort: if the torrent isn't known to the backend (e.g. already gone),
+        // we swallow the error and treat the delete as successful.
+        match self.backend.remove_torrent_with_files(&info_hash).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    info_hash = %info_hash,
+                    "remove_engine_and_files: backend returned error (torrent may already be gone): {}",
+                    e
+                );
+                // Return OK — if the torrent doesn't exist in the backend, the files are
+                // already gone; there is nothing left to do.
+                Ok(())
+            }
+        }
+    }
+
     pub async fn get_all_statistics(&self) -> HashMap<String, crate::backend::EngineStats> {
         let engines = self.engines.read().await;
         let mut stats = HashMap::new();

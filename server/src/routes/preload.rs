@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -8,6 +8,7 @@ use axum::{
 use enginefs::backend::TorrentHandle;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -216,17 +217,22 @@ pub async fn preload_progress(
     match state.preload_sessions.get(&info_hash) {
         Some(task) => {
             let status = task.progress.lock().unwrap().clone();
-            // Compute flat progress value for convenience
+            // Compute flat progress and speed values for convenience
             let progress_value = match &status {
                 PreloadProgress::Pending => 0.0,
                 PreloadProgress::Downloading { progress, .. } => *progress,
                 PreloadProgress::Ready => 1.0,
                 PreloadProgress::Failed { .. } => 0.0,
             };
+            let speed_bps = match &status {
+                PreloadProgress::Downloading { speed, .. } => *speed,
+                _ => 0.0,
+            };
             Json(json!({
                 "infoHash": info_hash,
                 "fileIdx":  task.file_idx,
                 "progress": progress_value,
+                "speedBps": speed_bps,
                 "state":    status,
             }))
             .into_response()
@@ -236,22 +242,60 @@ pub async fn preload_progress(
 }
 
 // ---------------------------------------------------------------------------
-// DELETE /{infoHash}/{fileIdx}/preload  — cancel (files kept on disk)
+// DELETE /{infoHash}/{fileIdx}/preload  — cancel (files kept) or hard-delete
+//
+// Optional query param: ?delete=true
+//   absent / false  — abort the download task but keep pieces on disk so that
+//                     subsequent playback or a re-triggered preload can reuse them.
+//   true            — abort the task AND call the backend to remove the torrent
+//                     and delete all downloaded data from disk.
 // ---------------------------------------------------------------------------
 
 pub async fn cancel_preload(
     Path((info_hash, _file_idx)): Path<(String, usize)>,
+    Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let info_hash = info_hash.to_lowercase();
+    let hard_delete = params.get("delete").map(|v| v == "true").unwrap_or(false);
 
     if let Some((_, task)) = state.preload_sessions.remove(&info_hash) {
         task.abort_handle.abort();
-        tracing::info!(info_hash = %info_hash, "Preload: cancelled");
+        tracing::info!(info_hash = %info_hash, hard_delete, "Preload: cancelled");
     }
 
-    // NOTE: we deliberately do NOT call engine.remove_engine() here —
-    // pieces already downloaded (in cache or on disk) are kept so that
+    if hard_delete {
+        if let Err(e) = state.engine.remove_engine_and_files(&info_hash).await {
+            tracing::warn!(info_hash = %info_hash, "Preload delete: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        tracing::info!(info_hash = %info_hash, "Preload: files deleted from disk");
+    }
+    // NOTE: when hard_delete=false we deliberately do NOT call engine.remove_engine()
+    // here — pieces already downloaded (in cache or on disk) are kept so that
     // subsequent playback or a re-triggered preload can use them.
-    StatusCode::NO_CONTENT
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /preload/disk-space  — report available bytes in the download directory
+// ---------------------------------------------------------------------------
+
+pub async fn disk_space(State(state): State<AppState>) -> impl IntoResponse {
+    let settings = state.settings.read().await;
+    let download_dir = settings.cache_root.clone();
+    drop(settings);
+
+    match fs2::available_space(&download_dir) {
+        Ok(bytes) => Json(json!({ "available": bytes, "path": download_dir })).into_response(),
+        Err(e) => {
+            tracing::warn!("disk_space: failed to query {}: {}", download_dir, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not determine disk space: {}", e),
+            )
+                .into_response()
+        }
+    }
 }

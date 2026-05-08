@@ -622,6 +622,17 @@ impl TorrentBackend for LibtorrentBackend {
         Ok(())
     }
 
+    async fn remove_torrent_with_files(&self, info_hash: &str) -> Result<()> {
+        let mut session = self.session.write().await;
+        let handle = session
+            .find_torrent(info_hash)
+            .map_err(|e| anyhow!("Torrent not found: {}", e))?;
+        session
+            .remove_torrent(&handle, true)
+            .map_err(|e| anyhow!("Failed to remove torrent with files: {}", e))?;
+        Ok(())
+    }
+
     async fn list_torrents(&self) -> Vec<String> {
         let session = self.session.read().await;
         session

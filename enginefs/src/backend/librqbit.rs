@@ -138,6 +138,12 @@ impl TorrentBackend for LibrqbitBackend {
         None
     }
 
+    async fn remove_torrent_with_files(&self, _info_hash: &str) -> Result<()> {
+        // librqbit backend — best-effort no-op; the file paths are deleted
+        // by the caller using std::fs::remove_file on each path from get_files().
+        Ok(())
+    }
+
     async fn remove_torrent(&self, _info_hash: &str) -> Result<()> {
         Ok(())
     }

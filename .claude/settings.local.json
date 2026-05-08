@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check *)",
+      "Bash(cargo build *)",
+      "Bash(cargo run *)",
+      "Bash(curl -s --max-time 3 http://127.0.0.1:11470/)",
+      "Bash(curl -s --max-time 3 -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://127.0.0.1:11470/)",
+      "Bash(curl -s --max-time 3 -L http://127.0.0.1:11470/)",
+      "Bash(curl -s --max-time 3 -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://127.0.0.1:11470/stats.json)",
+      "Bash(kill 638249)"
+    ]
+  }
+}

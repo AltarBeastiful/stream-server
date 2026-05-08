@@ -31,6 +31,8 @@ pub trait TorrentBackend: Send + Sync {
 
     async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle>;
     async fn remove_torrent(&self, info_hash: &str) -> Result<()>;
+    /// Remove a torrent and delete all its downloaded files from disk.
+    async fn remove_torrent_with_files(&self, info_hash: &str) -> Result<()>;
     async fn list_torrents(&self) -> Vec<String>;
 }
 
