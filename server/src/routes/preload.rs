@@ -224,13 +224,21 @@ pub async fn preload_progress(
     match state.preload_sessions.get(&info_hash) {
         Some(task) => {
             let status = task.progress.lock().unwrap().clone();
-            // Compute flat progress and speed values for convenience
-            let progress_value = match &status {
-                PreloadProgress::Pending => 0.0,
-                PreloadProgress::Downloading { progress, .. } => *progress,
-                PreloadProgress::Ready => 1.0,
-                PreloadProgress::Failed { .. } => 0.0,
+
+            // Use the torrent engine's actual piece-download percentage
+            // (total_wanted_done / total_wanted) so this matches the number
+            // shown in the player streaming stats.  Fall back to the sequential
+            // reader position only when the engine isn't available yet.
+            let engine_pct = if let Some(engine) = state.engine.get_engine(&info_hash).await {
+                engine.get_statistics().await.stream_progress
+            } else {
+                match &status {
+                    PreloadProgress::Downloading { progress, .. } => *progress,
+                    PreloadProgress::Ready => 1.0,
+                    _ => 0.0,
+                }
             };
+
             let speed_bps = match &status {
                 PreloadProgress::Downloading { speed, .. } => *speed,
                 _ => 0.0,
@@ -238,7 +246,7 @@ pub async fn preload_progress(
             Json(json!({
                 "infoHash": info_hash,
                 "fileIdx":  task.file_idx,
-                "progress": progress_value,
+                "progress": engine_pct,
                 "speedBps": speed_bps,
                 "state":    status,
             }))
